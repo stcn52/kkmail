@@ -11,6 +11,9 @@
 - 📊 **发送日志** - 跟踪邮件发送状态
 - 🗄️ **D1 数据库** - 存储邮件和用户数据
 - 🚀 **自动部署** - GitHub Actions 自动部署到 Cloudflare
+- 🎛️ **Web 管理界面** - 完整的后台管理系统
+- 🔑 **用户 API Token** - 基于用户的 API 访问控制
+- 📤 **简化 API** - 无需指定发件人的简单邮件发送接口
 
 ## 🛠️ 技术栈
 
@@ -109,7 +112,7 @@ npm run dev
 npm run deploy
 
 # 初始化数据库
-curl -X POST "https://kkmail.yourdomain.com/api/init"
+curl -X POST "https://mail.xgit.pro/api/init"
 ```
 
 ## 🔧 API 文档
@@ -134,7 +137,7 @@ Content-Type: application/json
 }
 ```
 
-### 发送邮件
+### 发送邮件（管理员接口）
 
 ```bash
 POST /api/send
@@ -149,6 +152,23 @@ Content-Type: application/json
   "text": "Hello World"
 }
 ```
+
+### 简化邮件发送（用户 API）
+
+```bash
+POST /api/send-simple
+X-API-Token: your_user_api_token
+Content-Type: application/json
+
+{
+  "to": "recipient@example.com",
+  "subject": "Test Email",
+  "text": "Hello World",
+  "html": "<h1>Hello World</h1>"  // 可选
+}
+```
+
+注：使用 `/api/send-simple` 时发件人将自动使用 API Token 对应用户的邮箱地址。
 
 ### 获取邮件列表
 
@@ -169,22 +189,38 @@ Authorization: Bearer your_jwt_token
 ```
 kkmail/
 ├── src/
-│   ├── index.js          # 主要的 Worker 代码
-│   ├── resend.js         # Resend API 集成
-│   ├── auth.js           # 认证服务
-│   ├── jwt.js            # JWT 工具函数
-│   └── email-routing.js  # 邮件路由处理
+│   ├── index.js         # 主要的 Worker 代码（包含管理界面）
+│   ├── resend.js        # Resend API 集成
+│   ├── auth.js          # 认证服务
+│   └── jwt.js           # JWT 工具函数
 ├── schemas/
-│   └── db.sql           # 数据库模式
-├── migrations/
-│   └── 001_initial.sql  # 初始数据迁移
+│   └── db.sql          # 数据库模式
 ├── .github/
 │   └── workflows/
-│       └── deploy.yml   # GitHub Actions 部署配置
-├── wrangler.toml        # Cloudflare Workers 配置
-├── package.json         # 项目依赖
-└── README.md           # 项目文档
+│       └── deploy.yml  # GitHub Actions 部署配置
+├── wrangler.toml       # Cloudflare Workers 配置
+├── package.json        # 项目依赖
+└── README.md          # 项目文档
 ```
+
+## 🎛️ Web 管理界面
+
+访问 `https://mail.xgit.pro/admin` 或 `https://mail.xgit.pro/` 进入管理界面。
+
+### 功能模块
+
+- **仪表板** - 系统概览和统计信息
+- **邮件管理** - 查看接收的邮件列表
+- **用户管理** - 创建和管理用户，生成 API Token
+- **邮件别名** - 配置邮件转发和别名
+- **发送邮件** - 通过界面直接发送邮件
+
+### 用户 API Token 管理
+
+1. 在用户管理页面为每个用户生成独立的 API Token
+2. 用户可以使用自己的 Token 调用 `/api/send-simple` 接口
+3. 发件人将自动使用 Token 对应用户的邮箱地址
+4. 支持 API 测试功能，可直接在管理界面测试 Token
 
 ## 🔒 安全配置
 
@@ -205,6 +241,9 @@ TXT resend._domainkey "v=DKIM1; k=rsa; p=your_dkim_public_key"
 
 # DMARC 记录
 TXT _dmarc "v=DMARC1; p=quarantine; rua=mailto:dmarc@yourdomain.com"
+
+# Worker 路由（用于管理界面）
+CNAME mail yourdomain.workers.dev
 ```
 
 ### 环境变量
@@ -212,6 +251,14 @@ TXT _dmarc "v=DMARC1; p=quarantine; rua=mailto:dmarc@yourdomain.com"
 - `RESEND_API_KEY` - Resend API 密钥
 - `JWT_SECRET` - JWT 签名密钥（建议使用强随机字符串）
 - `ADMIN_EMAIL` - 管理员邮箱地址
+
+### 安全建议
+
+1. **使用强密码** - 管理员账户密码应足够复杂
+2. **定期更换密钥** - 定期更新 JWT_SECRET 和 API 密钥
+3. **API Token 管理** - 定期检查和撤销不必要的 API Token
+4. **访问控制** - 限制管理界面的访问来源
+5. **日志监控** - 定期检查发送日志和异常活动
 
 ## 📊 监控和日志
 
@@ -246,17 +293,79 @@ TXT _dmarc "v=DMARC1; p=quarantine; rua=mailto:dmarc@yourdomain.com"
    - 验证令牌有效期
    - 确认用户权限
 
+4. **API Token 生成失败**
+   - 确认用户已正确创建
+   - 检查数据库连接
+   - 验证 Worker 部署状态
+
+5. **管理界面无法访问**
+   - 检查域名 DNS 解析
+   - 确认 Worker 路由配置
+   - 验证 Cloudflare 代理状态
+
 ### 调试命令
 
 ```bash
 # 查看 Worker 日志
-wrangler tail
+wrangler tail --env production
 
 # 测试数据库连接
-wrangler d1 execute kkmail-db --command="SELECT * FROM users LIMIT 1"
+wrangler d1 execute kkmail-db --env production --command="SELECT * FROM users LIMIT 1"
 
 # 检查环境变量
-wrangler secret list
+wrangler secret list --env production
+
+# 测试 API 接口
+curl -X POST "https://mail.xgit.pro/api/send-simple" \
+  -H "X-API-Token: your_token" \
+  -H "Content-Type: application/json" \
+  -d '{"to":"test@example.com","subject":"Test","text":"Hello"}'
+```
+
+## 📈 使用示例
+
+### cURL 示例
+
+```bash
+# 获取用户 API Token（管理员权限）
+curl -X GET "https://mail.xgit.pro/api/user-token/1" \
+  -H "Authorization: Bearer admin_jwt_token"
+
+# 使用用户 Token 发送邮件
+curl -X POST "https://mail.xgit.pro/api/send-simple" \
+  -H "X-API-Token: kkmail_abc123def456" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "to": "recipient@example.com",
+    "subject": "Hello from KKMail",
+    "text": "这是一封测试邮件",
+    "html": "<h1>这是一封测试邮件</h1>"
+  }'
+```
+
+### JavaScript 示例
+
+```javascript
+// 发送邮件
+async function sendEmail(token, emailData) {
+  const response = await fetch('https://mail.xgit.pro/api/send-simple', {
+    method: 'POST',
+    headers: {
+      'X-API-Token': token,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(emailData)
+  });
+
+  return await response.json();
+}
+
+// 使用示例
+const result = await sendEmail('kkmail_abc123def456', {
+  to: 'user@example.com',
+  subject: 'Welcome!',
+  text: 'Welcome to our service!'
+});
 ```
 
 ## 🤝 贡献
@@ -277,3 +386,5 @@ MIT License
 ---
 
 💡 **提示**: 确保在生产环境中使用强密码和安全的 JWT 密钥！
+
+🎯 **当前部署**: [https://mail.xgit.pro](https://mail.xgit.pro)

@@ -17,9 +17,10 @@ export class AuthService {
         const token = await sign(payload, this.jwtSecret);
         const tokenHash = await this.hashToken(token);
 
+        const expirySeconds = this.parseExpiry(expiresIn);
         await this.db.prepare(`
             INSERT INTO api_tokens (token_hash, user_id, permissions, expires_at)
-            VALUES (?, ?, ?, datetime('now', '+${expiresIn}'))
+            VALUES (?, ?, ?, datetime('now', '+${expirySeconds} seconds'))
         `).bind(tokenHash, userId, permissions).run();
 
         return token;
@@ -27,31 +28,26 @@ export class AuthService {
 
     async validateToken(token) {
         try {
+            // 首先验证 JWT 本身
             const payload = await verify(token, this.jwtSecret);
-            const tokenHash = await this.hashToken(token);
 
-            const tokenRecord = await this.db.prepare(`
-                SELECT t.*, u.email, u.is_active
-                FROM api_tokens t
-                JOIN users u ON t.user_id = u.id
-                WHERE t.token_hash = ? AND t.expires_at > datetime('now') AND u.is_active = 1
-            `).bind(tokenHash).first();
+            // 检查用户是否存在且活跃
+            const user = await this.db.prepare(`
+                SELECT id, email, is_active
+                FROM users
+                WHERE id = ? AND is_active = 1
+            `).bind(payload.userId).first();
 
-            if (!tokenRecord) {
-                return { valid: false, error: 'Token not found or expired' };
+            if (!user) {
+                return { valid: false, error: 'User not found or inactive' };
             }
-
-            await this.db.prepare(`
-                UPDATE api_tokens SET last_used_at = datetime('now')
-                WHERE token_hash = ?
-            `).bind(tokenHash).run();
 
             return {
                 valid: true,
                 user: {
-                    id: tokenRecord.user_id,
-                    email: tokenRecord.email,
-                    permissions: tokenRecord.permissions
+                    id: user.id,
+                    email: user.email,
+                    permissions: payload.permissions
                 }
             };
         } catch (error) {
