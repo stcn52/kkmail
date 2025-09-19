@@ -1,0 +1,27 @@
+{
+  "name": "kkmail",
+  "version": "1.0.0",
+  "description": "Custom domain email service using Cloudflare Workers and Resend",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "build": "webpack",
+    "test": "jest"
+  },
+  "dependencies": {
+    "@cloudflare/workers-types": "^4.20241022.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.82.0",
+    "webpack": "^5.95.0",
+    "webpack-cli": "^5.1.4",
+    "jest": "^29.7.0"
+  },
+  "author": "kk",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/stcn52/kkmail.git"
+  }
+}

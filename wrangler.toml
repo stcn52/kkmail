@@ -1,0 +1,29 @@
+name = "kkmail"
+main = "src/index.js"
+compatibility_date = "2024-10-22"
+
+# Environment variables
+[env.production.vars]
+RESEND_API_KEY = ""
+JWT_SECRET = ""
+ADMIN_EMAIL = ""
+
+# D1 Database binding
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "kkmail-db"
+database_id = ""
+
+# KV binding for caching
+[[env.production.kv_namespaces]]
+binding = "KV"
+id = ""
+
+# R2 bucket for email storage
+[[env.production.r2_buckets]]
+binding = "EMAIL_STORAGE"
+bucket_name = "kkmail-storage"
+
+# Email routing
+[env.production.send_email]
+name = "kkmail"
