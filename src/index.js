@@ -22,7 +22,7 @@ export default {
 
         try {
             if (path === '/api/init') {
-                return await handleInit(env.DB, env.ADMIN_EMAIL);
+                return await handleInit(env.DB, env.ADMIN_EMAIL, env);
             }
 
 
@@ -94,8 +94,12 @@ export default {
                 return await handleGenerateUserTokenById(request, auth, env.DB, userId, corsHeaders);
             }
 
+            if (path === '/api/usage-stats') {
+                return await handleGetUsageStats(request, auth, env.DB, corsHeaders);
+            }
+
             if (path === '/admin' || path === '/') {
-                return await handleAdminInterface();
+                return await handleAdminInterface(env);
             }
 
             return new Response('Not Found', { status: 404, headers: corsHeaders });
@@ -117,7 +121,7 @@ export default {
     }
 };
 
-async function handleInit(db, adminEmail) {
+async function handleInit(db, adminEmail, env) {
     try {
         const result = await db.exec(`
             CREATE TABLE IF NOT EXISTS users (
@@ -178,14 +182,29 @@ async function handleInit(db, adminEmail) {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS usage_limits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                limit_type TEXT NOT NULL, -- 'daily' or 'monthly'
+                limit_value INTEGER NOT NULL,
+                current_usage INTEGER DEFAULT 0,
+                reset_date DATE NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+
             INSERT OR IGNORE INTO users (email, password_hash, full_name, is_active)
             VALUES ('${adminEmail}', 'change_me', 'Admin User', TRUE);
 
             INSERT OR IGNORE INTO email_aliases (alias_email, target_email, is_active)
             VALUES
-                ('no-reply@yourdomain.com', '${adminEmail}', TRUE),
-                ('support@yourdomain.com', '${adminEmail}', TRUE),
-                ('contact@yourdomain.com', '${adminEmail}', TRUE);
+                ('no-reply@${env.EMAIL_DOMAIN || 'yourdomain.com'}', '${adminEmail}', TRUE),
+                ('support@${env.EMAIL_DOMAIN || 'yourdomain.com'}', '${adminEmail}', TRUE),
+                ('contact@${env.EMAIL_DOMAIN || 'yourdomain.com'}', '${adminEmail}', TRUE);
+
+            INSERT OR IGNORE INTO usage_limits (limit_type, limit_value, reset_date)
+            VALUES
+                ('daily', 100, date('now')),
+                ('monthly', 3000, date('now', 'start of month', '+1 month'));
         `);
 
         return new Response(JSON.stringify({
@@ -266,8 +285,25 @@ async function handleSendEmail(request, resend, auth, db, corsHeaders) {
             });
         }
 
+        // 检查发送限制
+        const limitCheck = await checkSendingLimits(db);
+        if (!limitCheck.allowed) {
+            return new Response(JSON.stringify({
+                error: 'Sending limit exceeded',
+                message: limitCheck.message
+            }), {
+                status: 429,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
         const emailData = await request.json();
         const result = await resend.sendEmail(emailData);
+
+        // 如果发送成功，更新用量
+        if (result.success) {
+            await updateUsageCount(db);
+        }
 
         await db.prepare(`
             INSERT INTO send_logs (from_email, to_email, subject, status, resend_id)
@@ -557,7 +593,7 @@ async function handleCreateAlias(request, auth, db, corsHeaders) {
     }
 }
 
-async function handleAdminInterface() {
+async function handleAdminInterface(env) {
     const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -786,13 +822,24 @@ async function handleAdminInterface() {
             font-size: 1rem;
             opacity: 0.9;
         }
+
+        .logout-btn:hover {
+            background: rgba(255,255,255,0.3) !important;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>📧 KKMail 管理界面</h1>
-            <p>自定义域名邮箱服务管理</p>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div>
+                    <h1>📧 KKMail 管理界面</h1>
+                    <p>自定义域名邮箱服务管理</p>
+                </div>
+                <button onclick="logout()" class="logout-btn" style="background: rgba(255,255,255,0.2); color: white; border: 1px solid rgba(255,255,255,0.3); padding: 8px 16px; border-radius: 20px; cursor: pointer; backdrop-filter: blur(10px); transition: all 0.3s;">退出登录</button>
+            </div>
         </div>
 
         <!-- 登录界面 -->
@@ -837,14 +884,44 @@ async function handleAdminInterface() {
                         <div class="stat-number" id="emailCount">-</div>
                         <div class="stat-label">邮件总数</div>
                     </div>
+                    <div class="stat-card">
+                        <div class="stat-number" id="todayUsage">-</div>
+                        <div class="stat-label">今日发送</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number" id="monthUsage">-</div>
+                        <div class="stat-label">本月发送</div>
+                    </div>
                 </div>
 
                 <div class="card">
                     <div class="card-header">系统信息</div>
                     <div class="card-body">
-                        <p><strong>服务地址:</strong> https://mail.yourdomain.com</p>
-                        <p><strong>邮件域名:</strong> yourdomain.com</p>
+                        <p><strong>服务地址:</strong> https://${env.DOMAIN || 'mail.yourdomain.com'}</p>
+                        <p><strong>邮件域名:</strong> ${env.EMAIL_DOMAIN || 'yourdomain.com'}</p>
                         <p><strong>状态:</strong> <span style="color: #28a745;">✅ 运行正常</span></p>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">发送限制 (Resend 免费套餐)</div>
+                    <div class="card-body">
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                            <div>
+                                <p><strong>每日限制:</strong> <span id="dailyLimitInfo">100 封</span></p>
+                                <div style="background: #f0f0f0; border-radius: 10px; height: 10px; margin-top: 5px;">
+                                    <div id="dailyProgressBar" style="background: linear-gradient(45deg, #4facfe 0%, #00f2fe 100%); height: 100%; border-radius: 10px; width: 0%; transition: width 0.3s;"></div>
+                                </div>
+                                <small id="dailyUsageText">今日已发送: 0 / 100</small>
+                            </div>
+                            <div>
+                                <p><strong>每月限制:</strong> <span id="monthlyLimitInfo">3,000 封</span></p>
+                                <div style="background: #f0f0f0; border-radius: 10px; height: 10px; margin-top: 5px;">
+                                    <div id="monthlyProgressBar" style="background: linear-gradient(45deg, #667eea 0%, #764ba2 100%); height: 100%; border-radius: 10px; width: 0%; transition: width 0.3s;"></div>
+                                </div>
+                                <small id="monthlyUsageText">本月已发送: 0 / 3,000</small>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -874,7 +951,7 @@ async function handleAdminInterface() {
                             <h4 style="margin-bottom: 15px;">添加新用户</h4>
                             <div class="form-group">
                                 <label>邮箱地址</label>
-                                <input type="email" id="newUserEmail" class="form-control" placeholder="user@yourdomain.com">
+                                <input type="email" id="newUserEmail" class="form-control" placeholder="user@${env.EMAIL_DOMAIN || 'yourdomain.com'}">
                             </div>
                             <div class="form-group">
                                 <label>密码</label>
@@ -904,11 +981,11 @@ async function handleAdminInterface() {
                             <h4 style="margin-bottom: 15px;">添加邮件别名</h4>
                             <div class="form-group">
                                 <label>别名邮箱</label>
-                                <input type="email" id="aliasEmail" class="form-control" placeholder="support@yourdomain.com">
+                                <input type="email" id="aliasEmail" class="form-control" placeholder="support@${env.EMAIL_DOMAIN || 'yourdomain.com'}">
                             </div>
                             <div class="form-group">
                                 <label>目标邮箱</label>
-                                <input type="email" id="targetEmail" class="form-control" placeholder="admin@yourdomain.com">
+                                <input type="email" id="targetEmail" class="form-control" placeholder="${env.ADMIN_EMAIL || 'admin@yourdomain.com'}">
                             </div>
                             <button onclick="createAlias()" class="btn btn-success">创建别名</button>
                             <button onclick="hideAddAliasForm()" class="btn btn-secondary">取消</button>
@@ -925,7 +1002,7 @@ async function handleAdminInterface() {
                     <div class="card-body">
                         <div class="form-group">
                             <label>发件人</label>
-                            <input type="email" id="sendFrom" class="form-control" value="admin@yourdomain.com">
+                            <input type="email" id="sendFrom" class="form-control" value="${env.ADMIN_EMAIL || 'admin@yourdomain.com'}">
                         </div>
                         <div class="form-group">
                             <label>收件人</label>
@@ -949,7 +1026,7 @@ async function handleAdminInterface() {
 
     <script>
         let authToken = '';
-        const API_BASE = 'https://mail.yourdomain.com/api';
+        const API_BASE = '/api';
 
         // 登录
         async function login() {
@@ -967,9 +1044,12 @@ async function handleAdminInterface() {
 
                 if (data.success) {
                     authToken = data.token;
+                    // 保存 token 到 localStorage
+                    localStorage.setItem('authToken', authToken);
                     document.getElementById('loginSection').classList.add('hidden');
                     document.getElementById('mainSection').classList.remove('hidden');
-                    loadDashboard();
+                    // 初始化路由，根据当前 hash 显示页面
+                    handleHashChange();
                 } else {
                     showError('loginError', data.error || '登录失败');
                 }
@@ -995,7 +1075,7 @@ async function handleAdminInterface() {
         }
 
         // 切换标签页
-        function showTab(tabName) {
+        function showTab(tabName, updateHash = true) {
             // 隐藏所有标签页
             document.querySelectorAll('.tab-content').forEach(tab => {
                 tab.classList.remove('active');
@@ -1006,7 +1086,19 @@ async function handleAdminInterface() {
 
             // 显示选中的标签页
             document.getElementById(tabName).classList.add('active');
-            event.target.classList.add('active');
+
+            // 激活对应的导航按钮
+            const navButtons = document.querySelectorAll('.nav-tab');
+            navButtons.forEach(button => {
+                if (button.textContent.includes(getTabDisplayName(tabName))) {
+                    button.classList.add('active');
+                }
+            });
+
+            // 更新 URL hash
+            if (updateHash) {
+                window.location.hash = tabName;
+            }
 
             // 加载对应数据
             if (tabName === 'dashboard') loadDashboard();
@@ -1015,17 +1107,58 @@ async function handleAdminInterface() {
             else if (tabName === 'aliases') loadAliases();
         }
 
+        // 获取标签页显示名称
+        function getTabDisplayName(tabName) {
+            const nameMap = {
+                'dashboard': '仪表板',
+                'emails': '邮件管理',
+                'users': '用户管理',
+                'aliases': '邮件别名',
+                'send': '发送邮件'
+            };
+            return nameMap[tabName] || tabName;
+        }
+
         // 加载仪表板
         async function loadDashboard() {
             try {
-                const [users, aliases] = await Promise.all([
+                const [users, aliases, usageStats] = await Promise.all([
                     apiRequest('/users'),
-                    apiRequest('/aliases')
+                    apiRequest('/aliases'),
+                    apiRequest('/usage-stats')
                 ]);
 
                 document.getElementById('userCount').textContent = users.users?.length || 0;
                 document.getElementById('aliasCount').textContent = aliases.aliases?.length || 0;
-                document.getElementById('emailCount').textContent = '0';
+                document.getElementById('emailCount').textContent = usageStats.usage?.total || 0;
+                document.getElementById('todayUsage').textContent = usageStats.usage?.today || 0;
+                document.getElementById('monthUsage').textContent = usageStats.usage?.month || 0;
+
+                // 更新发送限制进度条
+                if (usageStats.success) {
+                    const dailyUsage = usageStats.usage.today || 0;
+                    const monthlyUsage = usageStats.usage.month || 0;
+                    const dailyLimit = usageStats.resend_limits.daily_limit || 100;
+                    const monthlyLimit = usageStats.resend_limits.monthly_limit || 3000;
+
+                    // 每日进度
+                    const dailyPercent = Math.min((dailyUsage / dailyLimit) * 100, 100);
+                    document.getElementById('dailyProgressBar').style.width = dailyPercent + '%';
+                    document.getElementById('dailyUsageText').textContent = \`今日已发送: \${dailyUsage} / \${dailyLimit}\`;
+
+                    // 每月进度
+                    const monthlyPercent = Math.min((monthlyUsage / monthlyLimit) * 100, 100);
+                    document.getElementById('monthlyProgressBar').style.width = monthlyPercent + '%';
+                    document.getElementById('monthlyUsageText').textContent = \`本月已发送: \${monthlyUsage} / \${monthlyLimit}\`;
+
+                    // 如果接近限制，改变颜色
+                    if (dailyPercent > 80) {
+                        document.getElementById('dailyProgressBar').style.background = 'linear-gradient(45deg, #ff6b6b 0%, #ee5a24 100%)';
+                    }
+                    if (monthlyPercent > 80) {
+                        document.getElementById('monthlyProgressBar').style.background = 'linear-gradient(45deg, #ff6b6b 0%, #ee5a24 100%)';
+                    }
+                }
             } catch (error) {
                 console.error('Failed to load dashboard:', error);
             }
@@ -1404,7 +1537,7 @@ async function handleAdminInterface() {
                     </div>
                     <div style="padding: 20px;">
                         <h5>简单邮件发送API</h5>
-                        <p><strong>端点:</strong> <code>POST https://mail.yourdomain.com/api/send-simple</code></p>
+                        <p><strong>端点:</strong> <code>POST https://${env.DOMAIN || 'mail.yourdomain.com'}/api/send-simple</code></p>
 
                         <h6>请求头:</h6>
                         <pre style="background: #f8f9fa; padding: 10px; border-radius: 5px; overflow-x: auto;">X-API-Token: YOUR_API_TOKEN
@@ -1427,7 +1560,7 @@ Content-Type: application/json</pre>
 }</pre>
 
                         <h6>cURL示例:</h6>
-                        <pre style="background: #f8f9fa; padding: 10px; border-radius: 5px; overflow-x: auto;">curl -X POST https://mail.yourdomain.com/api/send-simple \\\\
+                        <pre style="background: #f8f9fa; padding: 10px; border-radius: 5px; overflow-x: auto;">curl -X POST https://${env.DOMAIN || 'mail.yourdomain.com'}/api/send-simple \\\\
   -H "X-API-Token: YOUR_API_TOKEN" \\\\
   -H "Content-Type: application/json" \\\\
   -d '{
@@ -1460,10 +1593,80 @@ Content-Type: application/json</pre>
             return await response.json();
         }
 
+        // Hash 路由处理
+        function handleHashChange() {
+            const hash = window.location.hash.replace('#', '');
+            const validTabs = ['dashboard', 'emails', 'users', 'aliases', 'send'];
+
+            if (validTabs.includes(hash)) {
+                showTab(hash, false); // 不更新 hash，避免循环
+            } else {
+                // 默认显示仪表板
+                showTab('dashboard', false);
+            }
+        }
+
+        // 监听 hash 变化
+        window.addEventListener('hashchange', handleHashChange);
+
         // 页面加载完成后的操作
         document.addEventListener('DOMContentLoaded', function() {
-            // 可以在这里添加初始化代码
+            // 初始化路由
+            handleHashChange();
+
+            // 检查是否有保存的登录状态
+            const savedToken = localStorage.getItem('authToken');
+            if (savedToken) {
+                authToken = savedToken;
+                // 验证 token 是否仍然有效
+                validateSavedToken();
+            }
         });
+
+        // 验证保存的 token
+        async function validateSavedToken() {
+            try {
+                const response = await apiRequest('/usage-stats');
+                if (response.success) {
+                    // Token 有效，显示主界面
+                    document.getElementById('loginSection').classList.add('hidden');
+                    document.getElementById('mainSection').classList.remove('hidden');
+                    handleHashChange(); // 加载当前 hash 对应的页面
+                } else {
+                    // Token 无效，清除并显示登录界面
+                    localStorage.removeItem('authToken');
+                    authToken = '';
+                }
+            } catch (error) {
+                // Token 无效，清除并显示登录界面
+                localStorage.removeItem('authToken');
+                authToken = '';
+            }
+        }
+
+        // 退出登录
+        function logout() {
+            // 清除 token
+            authToken = '';
+            localStorage.removeItem('authToken');
+
+            // 显示登录界面
+            document.getElementById('mainSection').classList.add('hidden');
+            document.getElementById('loginSection').classList.remove('hidden');
+
+            // 清空表单
+            document.getElementById('email').value = '';
+            document.getElementById('password').value = '';
+
+            // 清除可能显示的错误信息
+            const errorDiv = document.getElementById('loginError');
+            if (errorDiv) {
+                errorDiv.classList.add('hidden');
+            }
+
+            // 重置 hash 到首页
+            window.location.hash = '';
+        }
     </script>
 </body>
 </html>`;
@@ -1564,10 +1767,27 @@ async function handleSendEmailSimple(request, resend, db, apiToken, corsHeaders)
             });
         }
 
+        // 检查发送限制
+        const limitCheck = await checkSendingLimits(db);
+        if (!limitCheck.allowed) {
+            return new Response(JSON.stringify({
+                error: 'Sending limit exceeded',
+                message: limitCheck.message
+            }), {
+                status: 429,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
         // 使用token对应用户的邮箱作为发件人
         emailData.from = userToken.email;
 
         const result = await resend.sendEmail(emailData);
+
+        // 如果发送成功，更新用量
+        if (result.success) {
+            await updateUsageCount(db);
+        }
 
         // 记录发送日志
         await db.prepare(`
@@ -1890,4 +2110,158 @@ async function hashString(str) {
     const hashBuffer = await crypto.subtle.digest('SHA-256', data);
     const hashArray = Array.from(new Uint8Array(hashBuffer));
     return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// 检查发送限制
+async function checkSendingLimits(db) {
+    try {
+        // 获取当前限制设置
+        const limits = await db.prepare(`
+            SELECT * FROM usage_limits
+            ORDER BY limit_type
+        `).all();
+
+        if (!limits.results || limits.results.length === 0) {
+            return { allowed: true };
+        }
+
+        const today = new Date().toISOString().split('T')[0];
+        const thisMonth = new Date().toISOString().slice(0, 7);
+
+        // 检查每日和每月限制
+        for (const limit of limits.results) {
+            // 检查是否需要重置计数
+            if (limit.limit_type === 'daily' && limit.reset_date !== today) {
+                await db.prepare(`
+                    UPDATE usage_limits
+                    SET current_usage = 0, reset_date = ?, updated_at = datetime('now')
+                    WHERE limit_type = 'daily'
+                `).bind(today).run();
+                limit.current_usage = 0;
+            } else if (limit.limit_type === 'monthly' && !limit.reset_date.startsWith(thisMonth)) {
+                const nextMonth = new Date();
+                nextMonth.setMonth(nextMonth.getMonth() + 1, 1);
+                const nextMonthStr = nextMonth.toISOString().split('T')[0];
+
+                await db.prepare(`
+                    UPDATE usage_limits
+                    SET current_usage = 0, reset_date = ?, updated_at = datetime('now')
+                    WHERE limit_type = 'monthly'
+                `).bind(nextMonthStr).run();
+                limit.current_usage = 0;
+            }
+
+            // 检查是否超出限制
+            if (limit.current_usage >= limit.limit_value) {
+                return {
+                    allowed: false,
+                    message: `${limit.limit_type === 'daily' ? '每日' : '每月'}发送限制已达上限 (${limit.limit_value} 封)`
+                };
+            }
+        }
+
+        return { allowed: true };
+    } catch (error) {
+        console.error('Check limits error:', error);
+        return { allowed: true }; // 出错时允许发送，避免完全阻断
+    }
+}
+
+// 更新用量计数
+async function updateUsageCount(db) {
+    try {
+        // 更新每日用量
+        await db.prepare(`
+            UPDATE usage_limits
+            SET current_usage = current_usage + 1, updated_at = datetime('now')
+            WHERE limit_type = 'daily'
+        `).run();
+
+        // 更新每月用量
+        await db.prepare(`
+            UPDATE usage_limits
+            SET current_usage = current_usage + 1, updated_at = datetime('now')
+            WHERE limit_type = 'monthly'
+        `).run();
+    } catch (error) {
+        console.error('Update usage count error:', error);
+    }
+}
+
+// 获取用量统计
+async function handleGetUsageStats(request, auth, db, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 获取用量限制信息
+        const limits = await db.prepare(`
+            SELECT * FROM usage_limits
+            ORDER BY limit_type
+        `).all();
+
+        // 获取今日发送统计
+        const todayStats = await db.prepare(`
+            SELECT COUNT(*) as count
+            FROM send_logs
+            WHERE date(created_at) = date('now') AND status = 'sent'
+        `).first();
+
+        // 获取本月发送统计
+        const monthStats = await db.prepare(`
+            SELECT COUNT(*) as count
+            FROM send_logs
+            WHERE strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now') AND status = 'sent'
+        `).first();
+
+        // 获取总发送统计
+        const totalStats = await db.prepare(`
+            SELECT
+                COUNT(*) as total_sent,
+                COUNT(CASE WHEN status = 'sent' THEN 1 END) as successful_sent,
+                COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed_sent
+            FROM send_logs
+        `).first();
+
+        const result = {
+            success: true,
+            limits: limits.results || [],
+            usage: {
+                today: todayStats?.count || 0,
+                month: monthStats?.count || 0,
+                total: totalStats?.total_sent || 0,
+                successful: totalStats?.successful_sent || 0,
+                failed: totalStats?.failed_sent || 0
+            },
+            resend_limits: {
+                daily_limit: 100,
+                monthly_limit: 3000,
+                plan: 'Free'
+            }
+        };
+
+        return new Response(JSON.stringify(result), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
 }

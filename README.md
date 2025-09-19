@@ -82,9 +82,11 @@ id = "你的KV命名空间ID"
 
 设置环境变量：
 ```bash
-wrangler secret put RESEND_API_KEY
-wrangler secret put JWT_SECRET
-wrangler secret put ADMIN_EMAIL
+wrangler secret put RESEND_API_KEY --env production
+wrangler secret put JWT_SECRET --env production
+wrangler secret put ADMIN_EMAIL --env production
+wrangler secret put DOMAIN --env production          # 你的服务域名，如：mail.yourdomain.com
+wrangler secret put EMAIL_DOMAIN --env production    # 你的邮件域名，如：yourdomain.com
 ```
 
 ### 4. Resend 配置
@@ -112,7 +114,7 @@ npm run dev
 npm run deploy
 
 # 初始化数据库
-curl -X POST "https://mail.xgit.pro/api/init"
+curl -X POST "https://mail.yourdomain.com/api/init"
 ```
 
 ## 🔧 API 文档
@@ -205,7 +207,7 @@ kkmail/
 
 ## 🎛️ Web 管理界面
 
-访问 `https://mail.xgit.pro/admin` 或 `https://mail.xgit.pro/` 进入管理界面。
+访问 `https://mail.yourdomain.com/admin` 或 `https://mail.yourdomain.com/` 进入管理界面。
 
 ### 功能模块
 
@@ -251,6 +253,8 @@ CNAME mail yourdomain.workers.dev
 - `RESEND_API_KEY` - Resend API 密钥
 - `JWT_SECRET` - JWT 签名密钥（建议使用强随机字符串）
 - `ADMIN_EMAIL` - 管理员邮箱地址
+- `DOMAIN` - 服务域名（如：mail.yourdomain.com）
+- `EMAIL_DOMAIN` - 邮件域名（如：yourdomain.com）
 
 ### 安全建议
 
@@ -316,7 +320,7 @@ wrangler d1 execute kkmail-db --env production --command="SELECT * FROM users LI
 wrangler secret list --env production
 
 # 测试 API 接口
-curl -X POST "https://mail.xgit.pro/api/send-simple" \
+curl -X POST "https://mail.yourdomain.com/api/send-simple" \
   -H "X-API-Token: your_token" \
   -H "Content-Type: application/json" \
   -d '{"to":"test@example.com","subject":"Test","text":"Hello"}'
@@ -328,11 +332,11 @@ curl -X POST "https://mail.xgit.pro/api/send-simple" \
 
 ```bash
 # 获取用户 API Token（管理员权限）
-curl -X GET "https://mail.xgit.pro/api/user-token/1" \
+curl -X GET "https://mail.yourdomain.com/api/user-token/1" \
   -H "Authorization: Bearer admin_jwt_token"
 
 # 使用用户 Token 发送邮件
-curl -X POST "https://mail.xgit.pro/api/send-simple" \
+curl -X POST "https://mail.yourdomain.com/api/send-simple" \
   -H "X-API-Token: kkmail_abc123def456" \
   -H "Content-Type: application/json" \
   -d '{
@@ -348,7 +352,7 @@ curl -X POST "https://mail.xgit.pro/api/send-simple" \
 ```javascript
 // 发送邮件
 async function sendEmail(token, emailData) {
-  const response = await fetch('https://mail.xgit.pro/api/send-simple', {
+  const response = await fetch('https://mail.yourdomain.com/api/send-simple', {
     method: 'POST',
     headers: {
       'X-API-Token': token,
@@ -387,4 +391,4 @@ MIT License
 
 💡 **提示**: 确保在生产环境中使用强密码和安全的 JWT 密钥！
 
-🎯 **当前部署**: [https://mail.xgit.pro](https://mail.xgit.pro)
+🎯 **当前部署**: https://mail.yourdomain.com

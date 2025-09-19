@@ -9,10 +9,21 @@ yarn-error.log*
 .env.local
 .env.production
 .env.development
-
+wrangler.toml
 # Wrangler
 .wrangler/
 wrangler.toml.backup
+
+# Private configuration files (keep private configs out of git)
+*.private
+wrangler.toml.local
+src/index.js.local
+
+# Configuration and deployment scripts (may contain private info)
+scripts/clean-for-public.sh
+scripts/restore-private.sh
+scripts/deploy.sh
+scripts/README.md
 
 # Build outputs
 dist/
