@@ -1,5 +1,6 @@
 import { ResendService } from './resend.js';
 import { AuthService } from './auth.js';
+import { TempEmailService } from './temp-email.js';
 
 export default {
     async fetch(request, env, ctx) {
@@ -9,6 +10,7 @@ export default {
 
         const resend = new ResendService(env.RESEND_API_KEY);
         const auth = new AuthService(env.JWT_SECRET, env.DB);
+        const tempEmail = new TempEmailService(env.DB);
 
         const corsHeaders = {
             'Access-Control-Allow-Origin': '*',
@@ -98,6 +100,53 @@ export default {
                 return await handleGetUsageStats(request, auth, env.DB, corsHeaders);
             }
 
+            // Temporary Email endpoints
+            if (path === '/api/temp-email/create') {
+                return await handleCreateTempEmail(request, tempEmail, env.EMAIL_DOMAIN, corsHeaders);
+            }
+
+            if (path === '/api/temp-email/create-signup') {
+                return await handleCreateSignupTempEmail(request, tempEmail, env.EMAIL_DOMAIN, corsHeaders);
+            }
+
+            if (path === '/api/temp-email/create-verification') {
+                return await handleCreateVerificationTempEmail(request, tempEmail, env.EMAIL_DOMAIN, corsHeaders);
+            }
+
+            if (path.startsWith('/api/temp-email/')) {
+                const pathParts = path.split('/');
+                const email = decodeURIComponent(pathParts[3]);
+                const action = pathParts[4];
+
+                if (action === 'emails') {
+                    return await handleGetTempEmails(request, tempEmail, email, corsHeaders);
+                } else if (action === 'extend') {
+                    return await handleExtendTempEmail(request, tempEmail, email, corsHeaders);
+                } else if (action === 'stats') {
+                    return await handleGetTempEmailStats(request, tempEmail, email, corsHeaders);
+                } else if (action === 'mark-read') {
+                    return await handleMarkTempEmailAsRead(request, tempEmail, email, corsHeaders);
+                } else if (action === 'delete-email') {
+                    return await handleDeleteTempEmail(request, tempEmail, email, corsHeaders);
+                }
+            }
+
+            if (path === '/api/temp-email/admin/all') {
+                return await handleGetAllTempEmails(request, auth, tempEmail, corsHeaders);
+            }
+
+            if (path === '/api/temp-email/admin/stats') {
+                return await handleGetTempEmailAdminStats(request, auth, tempEmail, corsHeaders);
+            }
+
+            if (path === '/api/temp-email/admin/cleanup') {
+                return await handleCleanupExpiredTempEmails(request, auth, tempEmail, corsHeaders);
+            }
+
+            if (path === '/temp-email' || path === '/temp') {
+                return await handleTempEmailInterface();
+            }
+
             if (path === '/admin' || path === '/') {
                 return await handleAdminInterface(env);
             }
@@ -117,7 +166,8 @@ export default {
     },
 
     async email(message, env, ctx) {
-        return await handleIncomingEmail(message, env.DB);
+        const tempEmail = new TempEmailService(env.DB);
+        return await handleIncomingEmail(message, env.DB, tempEmail);
     }
 };
 
@@ -205,6 +255,34 @@ async function handleInit(db, adminEmail, env) {
             VALUES
                 ('daily', 100, date('now')),
                 ('monthly', 3000, date('now', 'start of month', '+1 month'));
+
+            -- Create temp emails table if not exists
+            CREATE TABLE IF NOT EXISTS temp_emails (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE NOT NULL,
+                access_token TEXT,
+                expires_at DATETIME NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_accessed_at DATETIME,
+                is_active BOOLEAN DEFAULT TRUE,
+                purpose TEXT DEFAULT 'general',
+                max_emails INTEGER DEFAULT 50,
+                received_count INTEGER DEFAULT 0
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_temp_emails_email ON temp_emails(email);
+            CREATE INDEX IF NOT EXISTS idx_temp_emails_expires_at ON temp_emails(expires_at);
+            CREATE INDEX IF NOT EXISTS idx_temp_emails_active ON temp_emails(is_active, expires_at);
+
+            CREATE TABLE IF NOT EXISTS temp_email_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                temp_email TEXT NOT NULL,
+                action TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                details TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_temp_email_usage_email ON temp_email_usage(temp_email, timestamp);
         `);
 
         return new Response(JSON.stringify({
@@ -255,6 +333,353 @@ async function handleLogin(request, auth, corsHeaders) {
             token,
             user: { id: user.id, email: user.email }
         }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+// Temporary Email Handler Functions
+async function handleCreateTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { expiryHours = 24, purpose = 'general', maxEmails = 50 } = body;
+
+        const result = await tempEmailService.createTempEmail(domain, {
+            expiryHours,
+            purpose,
+            maxEmails
+        });
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateSignupTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { serviceName } = body;
+
+        const result = await tempEmailService.createSignupTempEmail(domain, serviceName);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateVerificationTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { verificationType = 'email' } = body;
+
+        const result = await tempEmailService.createVerificationTempEmail(domain, verificationType);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmails(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmails(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleExtendTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, additionalHours = 24 } = body;
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.extendTempEmail(email, accessToken, additionalHours);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailStats(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getUsageStats(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleMarkTempEmailAsRead(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.markEmailAsRead(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleDeleteTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.deleteEmail(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetAllTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const url = new URL(request.url);
+        const limit = parseInt(url.searchParams.get('limit')) || 50;
+        const offset = parseInt(url.searchParams.get('offset')) || 0;
+
+        const result = await tempEmailService.getAllTempEmails(limit, offset);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailAdminStats(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmailStats();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCleanupExpiredTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.cleanupExpiredEmails();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
             headers: { ...corsHeaders, 'Content-Type': 'application/json' }
         });
     } catch (error) {
@@ -328,6 +753,353 @@ async function handleSendEmail(request, resend, auth, db, corsHeaders) {
     }
 }
 
+// Temporary Email Handler Functions
+async function handleCreateTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { expiryHours = 24, purpose = 'general', maxEmails = 50 } = body;
+
+        const result = await tempEmailService.createTempEmail(domain, {
+            expiryHours,
+            purpose,
+            maxEmails
+        });
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateSignupTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { serviceName } = body;
+
+        const result = await tempEmailService.createSignupTempEmail(domain, serviceName);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateVerificationTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { verificationType = 'email' } = body;
+
+        const result = await tempEmailService.createVerificationTempEmail(domain, verificationType);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmails(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmails(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleExtendTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, additionalHours = 24 } = body;
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.extendTempEmail(email, accessToken, additionalHours);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailStats(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getUsageStats(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleMarkTempEmailAsRead(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.markEmailAsRead(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleDeleteTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.deleteEmail(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetAllTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const url = new URL(request.url);
+        const limit = parseInt(url.searchParams.get('limit')) || 50;
+        const offset = parseInt(url.searchParams.get('offset')) || 0;
+
+        const result = await tempEmailService.getAllTempEmails(limit, offset);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailAdminStats(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmailStats();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCleanupExpiredTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.cleanupExpiredEmails();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
 async function handleGetEmails(request, auth, db, corsHeaders) {
     try {
         const authHeader = request.headers.get('Authorization');
@@ -384,7 +1156,354 @@ async function handleGetEmails(request, auth, db, corsHeaders) {
     }
 }
 
-async function handleIncomingEmail(message, db) {
+// Temporary Email Handler Functions
+async function handleCreateTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { expiryHours = 24, purpose = 'general', maxEmails = 50 } = body;
+
+        const result = await tempEmailService.createTempEmail(domain, {
+            expiryHours,
+            purpose,
+            maxEmails
+        });
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateSignupTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { serviceName } = body;
+
+        const result = await tempEmailService.createSignupTempEmail(domain, serviceName);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateVerificationTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { verificationType = 'email' } = body;
+
+        const result = await tempEmailService.createVerificationTempEmail(domain, verificationType);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmails(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmails(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleExtendTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, additionalHours = 24 } = body;
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.extendTempEmail(email, accessToken, additionalHours);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailStats(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getUsageStats(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleMarkTempEmailAsRead(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.markEmailAsRead(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleDeleteTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.deleteEmail(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetAllTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const url = new URL(request.url);
+        const limit = parseInt(url.searchParams.get('limit')) || 50;
+        const offset = parseInt(url.searchParams.get('offset')) || 0;
+
+        const result = await tempEmailService.getAllTempEmails(limit, offset);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailAdminStats(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmailStats();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCleanupExpiredTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.cleanupExpiredEmails();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleIncomingEmail(message, db, tempEmailService) {
     try {
         const messageId = message.headers.get('message-id') || `kkmail-${Date.now()}-${Math.random()}`;
         const from = message.from;
@@ -407,6 +1526,9 @@ async function handleIncomingEmail(message, db) {
             (message_id, from_email, to_email, subject, body_text, body_html, headers, status)
             VALUES (?, ?, ?, ?, ?, ?, ?, 'received')
         `).bind(messageId, from, to, subject, bodyText, bodyHtml, headers).run();
+
+        // Check if this is a temporary email
+        await tempEmailService.onEmailReceived(to, from, subject);
 
         const aliases = await db.prepare(`
             SELECT target_email FROM email_aliases
@@ -462,6 +1584,353 @@ async function handleGetUsers(request, auth, db, corsHeaders) {
     }
 }
 
+// Temporary Email Handler Functions
+async function handleCreateTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { expiryHours = 24, purpose = 'general', maxEmails = 50 } = body;
+
+        const result = await tempEmailService.createTempEmail(domain, {
+            expiryHours,
+            purpose,
+            maxEmails
+        });
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateSignupTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { serviceName } = body;
+
+        const result = await tempEmailService.createSignupTempEmail(domain, serviceName);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateVerificationTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { verificationType = 'email' } = body;
+
+        const result = await tempEmailService.createVerificationTempEmail(domain, verificationType);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmails(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmails(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleExtendTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, additionalHours = 24 } = body;
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.extendTempEmail(email, accessToken, additionalHours);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailStats(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getUsageStats(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleMarkTempEmailAsRead(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.markEmailAsRead(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleDeleteTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.deleteEmail(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetAllTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const url = new URL(request.url);
+        const limit = parseInt(url.searchParams.get('limit')) || 50;
+        const offset = parseInt(url.searchParams.get('offset')) || 0;
+
+        const result = await tempEmailService.getAllTempEmails(limit, offset);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailAdminStats(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmailStats();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCleanupExpiredTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.cleanupExpiredEmails();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
 async function handleCreateUser(request, auth, db, corsHeaders) {
     try {
         const authHeader = request.headers.get('Authorization');
@@ -492,6 +1961,353 @@ async function handleCreateUser(request, auth, db, corsHeaders) {
         }
 
         const result = await auth.createUser(email, password, fullName || '');
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+// Temporary Email Handler Functions
+async function handleCreateTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { expiryHours = 24, purpose = 'general', maxEmails = 50 } = body;
+
+        const result = await tempEmailService.createTempEmail(domain, {
+            expiryHours,
+            purpose,
+            maxEmails
+        });
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateSignupTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { serviceName } = body;
+
+        const result = await tempEmailService.createSignupTempEmail(domain, serviceName);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateVerificationTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { verificationType = 'email' } = body;
+
+        const result = await tempEmailService.createVerificationTempEmail(domain, verificationType);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmails(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmails(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleExtendTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, additionalHours = 24 } = body;
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.extendTempEmail(email, accessToken, additionalHours);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailStats(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getUsageStats(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleMarkTempEmailAsRead(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.markEmailAsRead(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleDeleteTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.deleteEmail(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetAllTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const url = new URL(request.url);
+        const limit = parseInt(url.searchParams.get('limit')) || 50;
+        const offset = parseInt(url.searchParams.get('offset')) || 0;
+
+        const result = await tempEmailService.getAllTempEmails(limit, offset);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailAdminStats(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmailStats();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCleanupExpiredTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.cleanupExpiredEmails();
 
         return new Response(JSON.stringify(result), {
             status: result.success ? 200 : 400,
@@ -545,6 +2361,353 @@ async function handleGetAliases(request, auth, db, corsHeaders) {
     }
 }
 
+// Temporary Email Handler Functions
+async function handleCreateTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { expiryHours = 24, purpose = 'general', maxEmails = 50 } = body;
+
+        const result = await tempEmailService.createTempEmail(domain, {
+            expiryHours,
+            purpose,
+            maxEmails
+        });
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateSignupTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { serviceName } = body;
+
+        const result = await tempEmailService.createSignupTempEmail(domain, serviceName);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateVerificationTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { verificationType = 'email' } = body;
+
+        const result = await tempEmailService.createVerificationTempEmail(domain, verificationType);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmails(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmails(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleExtendTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, additionalHours = 24 } = body;
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.extendTempEmail(email, accessToken, additionalHours);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailStats(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getUsageStats(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleMarkTempEmailAsRead(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.markEmailAsRead(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleDeleteTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.deleteEmail(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetAllTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const url = new URL(request.url);
+        const limit = parseInt(url.searchParams.get('limit')) || 50;
+        const offset = parseInt(url.searchParams.get('offset')) || 0;
+
+        const result = await tempEmailService.getAllTempEmails(limit, offset);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailAdminStats(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmailStats();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCleanupExpiredTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.cleanupExpiredEmails();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
 async function handleCreateAlias(request, auth, db, corsHeaders) {
     try {
         const authHeader = request.headers.get('Authorization');
@@ -583,6 +2746,353 @@ async function handleCreateAlias(request, auth, db, corsHeaders) {
             success: true,
             message: 'Email alias created successfully'
         }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+// Temporary Email Handler Functions
+async function handleCreateTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { expiryHours = 24, purpose = 'general', maxEmails = 50 } = body;
+
+        const result = await tempEmailService.createTempEmail(domain, {
+            expiryHours,
+            purpose,
+            maxEmails
+        });
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateSignupTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { serviceName } = body;
+
+        const result = await tempEmailService.createSignupTempEmail(domain, serviceName);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateVerificationTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { verificationType = 'email' } = body;
+
+        const result = await tempEmailService.createVerificationTempEmail(domain, verificationType);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmails(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmails(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleExtendTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, additionalHours = 24 } = body;
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.extendTempEmail(email, accessToken, additionalHours);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailStats(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getUsageStats(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleMarkTempEmailAsRead(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.markEmailAsRead(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleDeleteTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.deleteEmail(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetAllTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const url = new URL(request.url);
+        const limit = parseInt(url.searchParams.get('limit')) || 50;
+        const offset = parseInt(url.searchParams.get('offset')) || 0;
+
+        const result = await tempEmailService.getAllTempEmails(limit, offset);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailAdminStats(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmailStats();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCleanupExpiredTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.cleanupExpiredEmails();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
             headers: { ...corsHeaders, 'Content-Type': 'application/json' }
         });
     } catch (error) {
@@ -866,6 +3376,7 @@ async function handleAdminInterface(env) {
                 <button class="nav-tab" onclick="showTab('emails')">邮件管理</button>
                 <button class="nav-tab" onclick="showTab('users')">用户管理</button>
                 <button class="nav-tab" onclick="showTab('aliases')">邮件别名</button>
+                <button class="nav-tab" onclick="showTab('temp-emails')">临时邮箱</button>
                 <button class="nav-tab" onclick="showTab('send')">发送邮件</button>
             </div>
 
@@ -891,6 +3402,10 @@ async function handleAdminInterface(env) {
                     <div class="stat-card">
                         <div class="stat-number" id="monthUsage">-</div>
                         <div class="stat-label">本月发送</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number" id="tempEmailCount">-</div>
+                        <div class="stat-label">活跃临时邮箱</div>
                     </div>
                 </div>
 
@@ -991,6 +3506,74 @@ async function handleAdminInterface(env) {
                             <button onclick="hideAddAliasForm()" class="btn btn-secondary">取消</button>
                         </div>
                         <div id="aliasesList" class="loading">加载中...</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 临时邮箱 -->
+            <div id="temp-emails" class="tab-content">
+                <div class="card">
+                    <div class="card-header">
+                        临时邮箱管理
+                        <button onclick="showCreateTempEmailForm()" class="btn btn-success" style="float: right;">创建临时邮箱</button>
+                    </div>
+                    <div class="card-body">
+                        <div id="createTempEmailForm" class="hidden" style="margin-bottom: 20px; padding: 20px; background: #f8f9fa; border-radius: 8px;">
+                            <h4 style="margin-bottom: 15px;">创建临时邮箱</h4>
+                            <div class="form-group">
+                                <label>用途类型</label>
+                                <select id="tempEmailPurpose" class="form-control">
+                                    <option value="general">通用</option>
+                                    <option value="signup">注册验证</option>
+                                    <option value="verification">邮箱验证</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>有效期（小时）</label>
+                                <input type="number" id="tempEmailExpiry" class="form-control" value="24" min="1" max="168">
+                            </div>
+                            <div class="form-group">
+                                <label>最大邮件数</label>
+                                <input type="number" id="tempEmailMaxEmails" class="form-control" value="50" min="1" max="100">
+                            </div>
+                            <div class="form-group" id="serviceNameGroup" style="display: none;">
+                                <label>服务名称（可选）</label>
+                                <input type="text" id="tempEmailServiceName" class="form-control" placeholder="例如：GitHub, Gmail等">
+                            </div>
+                            <button onclick="createTempEmail()" class="btn btn-success">创建</button>
+                            <button onclick="hideCreateTempEmailForm()" class="btn btn-secondary">取消</button>
+                        </div>
+                        <div id="tempEmailsList" class="loading">加载中...</div>
+                    </div>
+                </div>
+
+                <!-- 临时邮箱查看器 -->
+                <div class="card" style="margin-top: 20px;">
+                    <div class="card-header">临时邮箱查看器</div>
+                    <div class="card-body">
+                        <div class="form-group">
+                            <label>临时邮箱地址</label>
+                            <input type="email" id="viewTempEmail" class="form-control" placeholder="输入临时邮箱地址">
+                        </div>
+                        <div class="form-group">
+                            <label>访问令牌</label>
+                            <input type="text" id="viewTempEmailToken" class="form-control" placeholder="输入访问令牌">
+                        </div>
+                        <button onclick="viewTempEmailEmails()" class="btn btn-primary">查看邮件</button>
+                        <button onclick="extendTempEmailTime()" class="btn btn-warning">延长时间</button>
+                        <button onclick="showTempEmailStats()" class="btn btn-info">查看统计</button>
+                    </div>
+                </div>
+
+                <!-- 邮件列表显示区域 -->
+                <div id="tempEmailViewer" class="card hidden" style="margin-top: 20px;">
+                    <div class="card-header">
+                        <span id="tempEmailViewerTitle">邮件列表</span>
+                        <button onclick="refreshTempEmails()" class="btn btn-primary" style="float: right;">刷新</button>
+                    </div>
+                    <div class="card-body">
+                        <div id="tempEmailEmailsList">
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1105,6 +3688,7 @@ async function handleAdminInterface(env) {
             else if (tabName === 'emails') loadEmails();
             else if (tabName === 'users') loadUsers();
             else if (tabName === 'aliases') loadAliases();
+            else if (tabName === 'temp-emails') loadTempEmails();
         }
 
         // 获取标签页显示名称
@@ -1114,6 +3698,7 @@ async function handleAdminInterface(env) {
                 'emails': '邮件管理',
                 'users': '用户管理',
                 'aliases': '邮件别名',
+                'temp-emails': '临时邮箱',
                 'send': '发送邮件'
             };
             return nameMap[tabName] || tabName;
@@ -1122,10 +3707,11 @@ async function handleAdminInterface(env) {
         // 加载仪表板
         async function loadDashboard() {
             try {
-                const [users, aliases, usageStats] = await Promise.all([
+                const [users, aliases, usageStats, tempEmailStats] = await Promise.all([
                     apiRequest('/users'),
                     apiRequest('/aliases'),
-                    apiRequest('/usage-stats')
+                    apiRequest('/usage-stats'),
+                    apiRequest('/temp-email/admin/stats')
                 ]);
 
                 document.getElementById('userCount').textContent = users.users?.length || 0;
@@ -1133,6 +3719,7 @@ async function handleAdminInterface(env) {
                 document.getElementById('emailCount').textContent = usageStats.usage?.total || 0;
                 document.getElementById('todayUsage').textContent = usageStats.usage?.today || 0;
                 document.getElementById('monthUsage').textContent = usageStats.usage?.month || 0;
+                document.getElementById('tempEmailCount').textContent = tempEmailStats.stats?.activeTempEmails || 0;
 
                 // 更新发送限制进度条
                 if (usageStats.success) {
@@ -1596,7 +4183,7 @@ Content-Type: application/json</pre>
         // Hash 路由处理
         function handleHashChange() {
             const hash = window.location.hash.replace('#', '');
-            const validTabs = ['dashboard', 'emails', 'users', 'aliases', 'send'];
+            const validTabs = ['dashboard', 'emails', 'users', 'aliases', 'temp-emails', 'send'];
 
             if (validTabs.includes(hash)) {
                 showTab(hash, false); // 不更新 hash，避免循环
@@ -1644,6 +4231,422 @@ Content-Type: application/json</pre>
             }
         }
 
+        // 临时邮箱相关函数
+        async function loadTempEmails() {
+            try {
+                const response = await apiRequest('/temp-email/admin/all');
+                const tempEmailsDiv = document.getElementById('tempEmailsList');
+
+                if (response.tempEmails && response.tempEmails.length > 0) {
+                    tempEmailsDiv.innerHTML = \`
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th>邮箱地址</th>
+                                    <th>用途</th>
+                                    <th>创建时间</th>
+                                    <th>过期时间</th>
+                                    <th>收件数</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                \${response.tempEmails.map(tempEmail => \`
+                                    <tr>
+                                        <td><code style="font-size: 12px;">\${tempEmail.email}</code></td>
+                                        <td>\${getPurposeText(tempEmail.purpose)}</td>
+                                        <td>\${new Date(tempEmail.created_at).toLocaleString()}</td>
+                                        <td>\${new Date(tempEmail.expires_at).toLocaleString()}</td>
+                                        <td>\${tempEmail.email_count || 0}</td>
+                                        <td>
+                                            <button onclick="viewTempEmailDetails('\${tempEmail.email}')" class="btn btn-primary" style="font-size: 12px; padding: 4px 8px;">查看</button>
+                                            <button onclick="cleanupTempEmail('\${tempEmail.email}')" class="btn btn-danger" style="font-size: 12px; padding: 4px 8px;">清理</button>
+                                        </td>
+                                    </tr>
+                                \`).join('')}
+                            </tbody>
+                        </table>
+                    \`;
+                } else {
+                    tempEmailsDiv.innerHTML = '<p>暂无临时邮箱</p>';
+                }
+            } catch (error) {
+                document.getElementById('tempEmailsList').innerHTML = '<p style="color: red;">加载失败: ' + error.message + '</p>';
+            }
+        }
+
+        function getPurposeText(purpose) {
+            const purposeMap = {
+                'general': '通用',
+                'signup': '注册验证',
+                'verification': '邮箱验证'
+            };
+            return purposeMap[purpose] || purpose;
+        }
+
+        function showCreateTempEmailForm() {
+            document.getElementById('createTempEmailForm').classList.remove('hidden');
+            // 当选择注册验证时显示服务名称字段
+            document.getElementById('tempEmailPurpose').addEventListener('change', function() {
+                const serviceGroup = document.getElementById('serviceNameGroup');
+                if (this.value === 'signup') {
+                    serviceGroup.style.display = 'block';
+                } else {
+                    serviceGroup.style.display = 'none';
+                }
+            });
+        }
+
+        function hideCreateTempEmailForm() {
+            document.getElementById('createTempEmailForm').classList.add('hidden');
+        }
+
+        async function createTempEmail() {
+            const purpose = document.getElementById('tempEmailPurpose').value;
+            const expiryHours = parseInt(document.getElementById('tempEmailExpiry').value);
+            const maxEmails = parseInt(document.getElementById('tempEmailMaxEmails').value);
+            const serviceName = document.getElementById('tempEmailServiceName').value;
+
+            try {
+                let endpoint = '/temp-email/create';
+                let requestBody = { expiryHours, purpose, maxEmails };
+
+                if (purpose === 'signup') {
+                    endpoint = '/temp-email/create-signup';
+                    requestBody = { serviceName };
+                } else if (purpose === 'verification') {
+                    endpoint = '/temp-email/create-verification';
+                    requestBody = { verificationType: 'email' };
+                }
+
+                const response = await apiRequest(endpoint, 'POST', requestBody);
+
+                if (response.success) {
+                    showSuccess('临时邮箱创建成功！');
+                    showTempEmailResult(response);
+                    hideCreateTempEmailForm();
+                    loadTempEmails();
+                } else {
+                    alert('创建失败: ' + response.error);
+                }
+            } catch (error) {
+                alert('创建失败: ' + error.message);
+            }
+        }
+
+        function showTempEmailResult(result) {
+            const modal = document.createElement('div');
+            modal.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; display: flex; align-items: center; justify-content: center;';
+
+            modal.innerHTML = \`
+                <div style="background: white; border-radius: 10px; width: 90%; max-width: 600px; max-height: 80vh; overflow-y: auto;">
+                    <div style="padding: 20px; border-bottom: 1px solid #eee;">
+                        <h3>✅ 临时邮箱创建成功</h3>
+                        <button onclick="this.closest('div[style*=position]').remove()" style="float: right; margin-top: -30px; border: none; background: none; font-size: 20px; cursor: pointer;">×</button>
+                    </div>
+                    <div style="padding: 20px;">
+                        <div style="margin-bottom: 15px;">
+                            <strong>邮箱地址:</strong>
+                            <div style="background: #f8f9fa; padding: 10px; border-radius: 5px; margin-top: 5px; font-family: monospace; font-size: 14px; word-break: break-all;">
+                                \${result.email}
+                            </div>
+                        </div>
+
+                        <div style="margin-bottom: 15px;">
+                            <strong>访问令牌:</strong>
+                            <div style="background: #f8f9fa; padding: 10px; border-radius: 5px; margin-top: 5px; font-family: monospace; font-size: 12px; word-break: break-all;">
+                                \${result.accessToken}
+                            </div>
+                        </div>
+
+                        <div style="margin-bottom: 15px;">
+                            <strong>过期时间:</strong> \${new Date(result.expiresAt).toLocaleString()}
+                        </div>
+
+                        <div style="margin-bottom: 15px;">
+                            <strong>用途:</strong> \${getPurposeText(result.purpose)}
+                        </div>
+
+                        <div style="background: #fff3cd; border: 1px solid #ffeaa7; padding: 15px; border-radius: 5px; margin-top: 15px;">
+                            <strong>⚠️ 重要提示:</strong><br>
+                            请妥善保存邮箱地址和访问令牌，访问令牌用于查看收到的邮件。邮箱将在过期时间后自动失效。
+                        </div>
+
+                        <div style="margin-top: 20px;">
+                            <button onclick="copyToClipboard('\${result.email}')" class="btn btn-primary">复制邮箱地址</button>
+                            <button onclick="copyToClipboard('\${result.accessToken}')" class="btn btn-secondary">复制访问令牌</button>
+                            <button onclick="setViewerData('\${result.email}', '\${result.accessToken}')" class="btn btn-success">在查看器中打开</button>
+                        </div>
+                    </div>
+                </div>
+            \`;
+
+            document.body.appendChild(modal);
+        }
+
+        function copyToClipboard(text) {
+            navigator.clipboard.writeText(text).then(() => {
+                showSuccess('已复制到剪贴板');
+            }).catch(() => {
+                // 备用方法
+                const textArea = document.createElement('textarea');
+                textArea.value = text;
+                document.body.appendChild(textArea);
+                textArea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textArea);
+                showSuccess('已复制到剪贴板');
+            });
+        }
+
+        function setViewerData(email, token) {
+            document.getElementById('viewTempEmail').value = email;
+            document.getElementById('viewTempEmailToken').value = token;
+            // 关闭模态框
+            const modal = document.querySelector('div[style*="position: fixed"]');
+            if (modal) modal.remove();
+            showSuccess('数据已填入查看器');
+        }
+
+        async function viewTempEmailEmails() {
+            const email = document.getElementById('viewTempEmail').value;
+            const token = document.getElementById('viewTempEmailToken').value;
+
+            if (!email || !token) {
+                alert('请输入邮箱地址和访问令牌');
+                return;
+            }
+
+            try {
+                const response = await fetch(\`\${API_BASE}/temp-email/\${encodeURIComponent(email)}/emails?token=\${encodeURIComponent(token)}\`);
+                const result = await response.json();
+
+                if (result.success) {
+                    showTempEmailEmails(result.emails, email);
+                } else {
+                    alert('获取邮件失败: ' + result.error);
+                }
+            } catch (error) {
+                alert('获取邮件失败: ' + error.message);
+            }
+        }
+
+        function showTempEmailEmails(emails, tempEmail) {
+            const viewer = document.getElementById('tempEmailViewer');
+            const title = document.getElementById('tempEmailViewerTitle');
+            const emailsList = document.getElementById('tempEmailEmailsList');
+
+            title.textContent = \`邮件列表 - \${tempEmail}\`;
+
+            if (emails && emails.length > 0) {
+                emailsList.innerHTML = \`
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>发件人</th>
+                                <th>主题</th>
+                                <th>时间</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            \${emails.map(email => \`
+                                <tr>
+                                    <td>\${email.from_email}</td>
+                                    <td>\${email.subject || '无主题'}</td>
+                                    <td>\${new Date(email.created_at).toLocaleString()}</td>
+                                    <td>
+                                        <button onclick="viewEmailContent('\${email.message_id}', '\${tempEmail}')" class="btn btn-primary" style="font-size: 12px; padding: 4px 8px;">查看</button>
+                                        <button onclick="markTempEmailAsRead('\${email.message_id}', '\${tempEmail}')" class="btn btn-success" style="font-size: 12px; padding: 4px 8px;">标记已读</button>
+                                        <button onclick="deleteTempEmail('\${email.message_id}', '\${tempEmail}')" class="btn btn-danger" style="font-size: 12px; padding: 4px 8px;">删除</button>
+                                    </td>
+                                </tr>
+                            \`).join('')}
+                        </tbody>
+                    </table>
+                \`;
+            } else {
+                emailsList.innerHTML = '<p>暂无邮件</p>';
+            }
+
+            viewer.classList.remove('hidden');
+        }
+
+        function viewEmailContent(messageId, tempEmail) {
+            // 这里可以实现邮件内容查看功能
+            alert('邮件内容查看功能 - Message ID: ' + messageId);
+        }
+
+        async function markTempEmailAsRead(messageId, tempEmail) {
+            const token = document.getElementById('viewTempEmailToken').value;
+
+            try {
+                const response = await fetch(\`\${API_BASE}/temp-email/\${encodeURIComponent(tempEmail)}/mark-read\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ accessToken: token, messageId })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    showSuccess('邮件已标记为已读');
+                    viewTempEmailEmails(); // 刷新列表
+                } else {
+                    alert('操作失败: ' + result.error);
+                }
+            } catch (error) {
+                alert('操作失败: ' + error.message);
+            }
+        }
+
+        async function deleteTempEmail(messageId, tempEmail) {
+            if (!confirm('确认删除此邮件？')) return;
+
+            const token = document.getElementById('viewTempEmailToken').value;
+
+            try {
+                const response = await fetch(\`\${API_BASE}/temp-email/\${encodeURIComponent(tempEmail)}/delete-email\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ accessToken: token, messageId })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    showSuccess('邮件已删除');
+                    viewTempEmailEmails(); // 刷新列表
+                } else {
+                    alert('删除失败: ' + result.error);
+                }
+            } catch (error) {
+                alert('删除失败: ' + error.message);
+            }
+        }
+
+        async function extendTempEmailTime() {
+            const email = document.getElementById('viewTempEmail').value;
+            const token = document.getElementById('viewTempEmailToken').value;
+
+            if (!email || !token) {
+                alert('请输入邮箱地址和访问令牌');
+                return;
+            }
+
+            const additionalHours = prompt('延长多少小时？', '24');
+            if (!additionalHours || isNaN(additionalHours)) return;
+
+            try {
+                const response = await fetch(\`\${API_BASE}/temp-email/\${encodeURIComponent(email)}/extend\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ accessToken: token, additionalHours: parseInt(additionalHours) })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    showSuccess('时间延长成功，新过期时间: ' + new Date(result.newExpiryDate).toLocaleString());
+                } else {
+                    alert('延长失败: ' + result.error);
+                }
+            } catch (error) {
+                alert('延长失败: ' + error.message);
+            }
+        }
+
+        async function showTempEmailStats() {
+            const email = document.getElementById('viewTempEmail').value;
+            const token = document.getElementById('viewTempEmailToken').value;
+
+            if (!email || !token) {
+                alert('请输入邮箱地址和访问令牌');
+                return;
+            }
+
+            try {
+                const response = await fetch(\`\${API_BASE}/temp-email/\${encodeURIComponent(email)}/stats?token=\${encodeURIComponent(token)}\`);
+                const result = await response.json();
+
+                if (result.success) {
+                    const modal = document.createElement('div');
+                    modal.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; display: flex; align-items: center; justify-content: center;';
+
+                    modal.innerHTML = \`
+                        <div style="background: white; border-radius: 10px; width: 90%; max-width: 600px; max-height: 80vh; overflow-y: auto;">
+                            <div style="padding: 20px; border-bottom: 1px solid #eee;">
+                                <h3>📊 临时邮箱统计</h3>
+                                <button onclick="this.closest('div[style*=position]').remove()" style="float: right; margin-top: -30px; border: none; background: none; font-size: 20px; cursor: pointer;">×</button>
+                            </div>
+                            <div style="padding: 20px;">
+                                <div style="margin-bottom: 15px;">
+                                    <strong>邮箱地址:</strong> \${result.tempEmail.email}
+                                </div>
+                                <div style="margin-bottom: 15px;">
+                                    <strong>用途:</strong> \${getPurposeText(result.tempEmail.purpose)}
+                                </div>
+                                <div style="margin-bottom: 15px;">
+                                    <strong>创建时间:</strong> \${new Date(result.tempEmail.created_at).toLocaleString()}
+                                </div>
+                                <div style="margin-bottom: 15px;">
+                                    <strong>过期时间:</strong> \${new Date(result.tempEmail.expires_at).toLocaleString()}
+                                </div>
+                                <div style="margin-bottom: 15px;">
+                                    <strong>最大邮件数:</strong> \${result.tempEmail.max_emails}
+                                </div>
+                                <div style="margin-bottom: 15px;">
+                                    <strong>已收邮件数:</strong> \${result.tempEmail.received_count}
+                                </div>
+                                <div style="margin-bottom: 15px;">
+                                    <strong>使用记录:</strong>
+                                    <div style="max-height: 200px; overflow-y: auto; background: #f8f9fa; padding: 10px; border-radius: 5px; margin-top: 5px;">
+                                        \${result.usage.map(record => \`
+                                            <div style="margin-bottom: 5px; font-size: 12px;">
+                                                \${new Date(record.timestamp).toLocaleString()} - \${record.action}
+                                                \${record.details ? \`: \${record.details}\` : ''}
+                                            </div>
+                                        \`).join('')}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    \`;
+
+                    document.body.appendChild(modal);
+                } else {
+                    alert('获取统计失败: ' + result.error);
+                }
+            } catch (error) {
+                alert('获取统计失败: ' + error.message);
+            }
+        }
+
+        function refreshTempEmails() {
+            viewTempEmailEmails();
+        }
+
+        async function viewTempEmailDetails(email) {
+            // 这里可以实现临时邮箱详情查看
+            alert('查看临时邮箱详情: ' + email);
+        }
+
+        async function cleanupTempEmail(email) {
+            if (!confirm('确认清理此临时邮箱？此操作将使其失效。')) return;
+
+            try {
+                const response = await apiRequest('/temp-email/admin/cleanup', 'POST');
+                if (response.success) {
+                    showSuccess('清理完成');
+                    loadTempEmails();
+                } else {
+                    alert('清理失败: ' + response.error);
+                }
+            } catch (error) {
+                alert('清理失败: ' + error.message);
+            }
+        }
+
         // 退出登录
         function logout() {
             // 清除 token
@@ -1667,6 +4670,853 @@ Content-Type: application/json</pre>
             // 重置 hash 到首页
             window.location.hash = '';
         }
+    </script>
+</body>
+</html>`;
+
+    return new Response(html, {
+        headers: { 'Content-Type': 'text/html; charset=utf-8' }
+    });
+}
+
+async function handleTempEmailInterface() {
+    // 读取临时邮箱HTML文件内容
+    const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>临时邮箱 - KKMail</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(45deg, #4facfe 0%, #00f2fe 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+        }
+
+        .main-content {
+            padding: 30px;
+        }
+
+        .section {
+            margin-bottom: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 10px;
+            border: 1px solid #e9ecef;
+        }
+
+        .section h3 {
+            margin-bottom: 15px;
+            color: #333;
+            border-bottom: 2px solid #4facfe;
+            padding-bottom: 5px;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #333;
+        }
+
+        .form-control {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e9ecef;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: all 0.3s;
+        }
+
+        .form-control:focus {
+            outline: none;
+            border-color: #4facfe;
+            box-shadow: 0 0 0 3px rgba(79, 172, 254, 0.1);
+        }
+
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin-right: 10px;
+            margin-bottom: 10px;
+            text-decoration: none;
+            display: inline-block;
+        }
+
+        .btn-primary {
+            background: linear-gradient(45deg, #4facfe 0%, #00f2fe 100%);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(79, 172, 254, 0.3);
+        }
+
+        .btn-success {
+            background: #28a745;
+            color: white;
+        }
+
+        .btn-warning {
+            background: #ffc107;
+            color: #212529;
+        }
+
+        .btn-danger {
+            background: #dc3545;
+            color: white;
+        }
+
+        .btn-secondary {
+            background: #6c757d;
+            color: white;
+        }
+
+        .email-display {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 8px;
+            border: 2px solid #4facfe;
+            font-family: monospace;
+            font-size: 18px;
+            font-weight: bold;
+            color: #4facfe;
+            word-break: break-all;
+            margin: 15px 0;
+            position: relative;
+        }
+
+        .copy-btn {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            padding: 5px 10px;
+            font-size: 12px;
+        }
+
+        .token-display {
+            background: #fff3cd;
+            border: 2px solid #ffeaa7;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 14px;
+            word-break: break-all;
+            margin: 15px 0;
+            position: relative;
+        }
+
+        .alert {
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        .alert-success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .alert-danger {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .alert-info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 20px;
+            color: #666;
+        }
+
+        .email-item {
+            background: white;
+            border: 1px solid #e9ecef;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 10px;
+            transition: all 0.3s;
+        }
+
+        .email-item:hover {
+            border-color: #4facfe;
+            box-shadow: 0 2px 10px rgba(79, 172, 254, 0.1);
+        }
+
+        .email-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 10px;
+        }
+
+        .email-from {
+            font-weight: bold;
+            color: #333;
+        }
+
+        .email-time {
+            color: #666;
+            font-size: 14px;
+        }
+
+        .email-subject {
+            font-size: 16px;
+            color: #4facfe;
+            margin-bottom: 10px;
+        }
+
+        .email-preview {
+            color: #666;
+            font-size: 14px;
+            line-height: 1.4;
+            max-height: 60px;
+            overflow: hidden;
+        }
+
+        .email-actions {
+            margin-top: 10px;
+            text-align: right;
+        }
+
+        .countdown {
+            background: #fff3cd;
+            border: 1px solid #ffeaa7;
+            padding: 10px;
+            border-radius: 8px;
+            margin: 15px 0;
+            text-align: center;
+            font-weight: bold;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+
+        .stat-item {
+            background: linear-gradient(45deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+        }
+
+        .stat-number {
+            font-size: 24px;
+            font-weight: bold;
+        }
+
+        .stat-label {
+            font-size: 14px;
+            opacity: 0.9;
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                margin: 10px;
+                border-radius: 10px;
+            }
+
+            .header {
+                padding: 20px;
+            }
+
+            .header h1 {
+                font-size: 2rem;
+            }
+
+            .main-content {
+                padding: 20px;
+            }
+
+            .email-header {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+
+            .email-actions {
+                text-align: left;
+            }
+
+            .copy-btn {
+                position: static;
+                margin-top: 10px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📧 临时邮箱服务</h1>
+            <p>一次性邮箱地址，用于注册验证和接收临时邮件</p>
+        </div>
+
+        <div class="main-content">
+            <!-- 创建临时邮箱 -->
+            <div class="section">
+                <h3>🆕 创建临时邮箱</h3>
+                <div class="form-group">
+                    <label>邮箱用途</label>
+                    <select id="purposeSelect" class="form-control">
+                        <option value="general">通用临时邮箱 (24小时)</option>
+                        <option value="signup">注册验证邮箱 (1小时)</option>
+                        <option value="verification">邮箱验证 (2小时)</option>
+                    </select>
+                </div>
+                <div id="serviceNameGroup" class="form-group hidden">
+                    <label>服务名称 (可选)</label>
+                    <input type="text" id="serviceName" class="form-control" placeholder="例如：GitHub, Gmail, Facebook">
+                </div>
+                <button onclick="createTempEmail()" class="btn btn-primary">创建临时邮箱</button>
+            </div>
+
+            <!-- 当前邮箱信息 -->
+            <div id="emailSection" class="section hidden">
+                <h3>📨 当前邮箱</h3>
+                <div id="emailDisplay" class="email-display">
+                    <button onclick="copyEmail()" class="btn btn-secondary copy-btn">复制</button>
+                </div>
+                <div id="tokenDisplay" class="token-display">
+                    <strong>访问令牌：</strong><span id="tokenText"></span>
+                    <button onclick="copyToken()" class="btn btn-secondary copy-btn">复制</button>
+                </div>
+                <div id="countdown" class="countdown"></div>
+
+                <div class="stats">
+                    <div class="stat-item">
+                        <div class="stat-number" id="emailCount">0</div>
+                        <div class="stat-label">收到邮件</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-number" id="maxEmails">-</div>
+                        <div class="stat-label">最大邮件数</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-number" id="remainingTime">-</div>
+                        <div class="stat-label">剩余时间</div>
+                    </div>
+                </div>
+
+                <div style="text-align: center; margin: 20px 0;">
+                    <button onclick="refreshEmails()" class="btn btn-primary">刷新邮件</button>
+                    <button onclick="extendTime()" class="btn btn-warning">延长时间</button>
+                    <button onclick="showStats()" class="btn btn-secondary">查看统计</button>
+                    <button onclick="resetEmail()" class="btn btn-danger">创建新邮箱</button>
+                </div>
+            </div>
+
+            <!-- 邮件列表 -->
+            <div id="emailsSection" class="section hidden">
+                <h3>📬 收件箱</h3>
+                <div id="emailsList" class="loading">暂无邮件</div>
+            </div>
+
+            <!-- 查看现有邮箱 -->
+            <div class="section">
+                <h3>🔍 查看现有邮箱</h3>
+                <div class="form-group">
+                    <label>邮箱地址</label>
+                    <input type="email" id="existingEmail" class="form-control" placeholder="输入临时邮箱地址">
+                </div>
+                <div class="form-group">
+                    <label>访问令牌</label>
+                    <input type="text" id="existingToken" class="form-control" placeholder="输入访问令牌">
+                </div>
+                <button onclick="loadExistingEmail()" class="btn btn-primary">查看邮箱</button>
+            </div>
+
+            <!-- 使用说明 -->
+            <div class="section">
+                <h3>📖 使用说明</h3>
+                <div class="alert alert-info">
+                    <strong>🛡️ 隐私保护：</strong><br>
+                    • 临时邮箱会在过期时间后自动删除<br>
+                    • 不会存储任何个人信息<br>
+                    • 请勿用于重要账户注册<br><br>
+
+                    <strong>📝 使用步骤：</strong><br>
+                    1. 选择邮箱用途并点击"创建临时邮箱"<br>
+                    2. 复制生成的邮箱地址用于注册或验证<br>
+                    3. 返回此页面查看收到的邮件<br>
+                    4. 妥善保存访问令牌以便后续查看<br><br>
+
+                    <strong>⚠️ 重要提示：</strong><br>
+                    • 邮箱过期后无法恢复<br>
+                    • 访问令牌用于邮件查看权限<br>
+                    • 建议及时处理重要邮件
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentEmail = '';
+        let currentToken = '';
+        let expiresAt = null;
+        let countdownInterval = null;
+        const API_BASE = '/api';
+
+        // 监听用途选择变化
+        document.getElementById('purposeSelect').addEventListener('change', function() {
+            const serviceGroup = document.getElementById('serviceNameGroup');
+            if (this.value === 'signup') {
+                serviceGroup.classList.remove('hidden');
+            } else {
+                serviceGroup.classList.add('hidden');
+            }
+        });
+
+        // 创建临时邮箱
+        async function createTempEmail() {
+            const purpose = document.getElementById('purposeSelect').value;
+            const serviceName = document.getElementById('serviceName').value;
+
+            try {
+                let endpoint = '/temp-email/create';
+                let requestBody = {};
+
+                if (purpose === 'signup') {
+                    endpoint = '/temp-email/create-signup';
+                    requestBody = { serviceName: serviceName || 'Unknown Service' };
+                } else if (purpose === 'verification') {
+                    endpoint = '/temp-email/create-verification';
+                    requestBody = { verificationType: 'email' };
+                } else {
+                    endpoint = '/temp-email/create';
+                    requestBody = {
+                        expiryHours: 24,
+                        purpose: 'general',
+                        maxEmails: 50
+                    };
+                }
+
+                const response = await fetch(API_BASE + endpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(requestBody)
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    setupEmail(result.email, result.accessToken, result.expiresAt, result.maxEmails);
+                    showSuccess('临时邮箱创建成功！');
+                } else {
+                    showError('创建失败: ' + result.error);
+                }
+            } catch (error) {
+                showError('创建失败: ' + error.message);
+            }
+        }
+
+        // 设置邮箱信息
+        function setupEmail(email, token, expires, maxEmails) {
+            currentEmail = email;
+            currentToken = token;
+            expiresAt = new Date(expires);
+
+            document.getElementById('emailDisplay').firstChild.textContent = email;
+            document.getElementById('tokenText').textContent = token;
+            document.getElementById('maxEmails').textContent = maxEmails || 50;
+
+            document.getElementById('emailSection').classList.remove('hidden');
+            document.getElementById('emailsSection').classList.remove('hidden');
+
+            startCountdown();
+            refreshEmails();
+
+            // 滚动到邮箱区域
+            document.getElementById('emailSection').scrollIntoView({ behavior: 'smooth' });
+        }
+
+        // 开始倒计时
+        function startCountdown() {
+            if (countdownInterval) {
+                clearInterval(countdownInterval);
+            }
+
+            countdownInterval = setInterval(() => {
+                const now = new Date();
+                const timeLeft = expiresAt - now;
+
+                if (timeLeft <= 0) {
+                    document.getElementById('countdown').innerHTML = '⏰ 邮箱已过期';
+                    document.getElementById('remainingTime').textContent = '已过期';
+                    clearInterval(countdownInterval);
+                    return;
+                }
+
+                const hours = Math.floor(timeLeft / (1000 * 60 * 60));
+                const minutes = Math.floor((timeLeft % (1000 * 60 * 60)) / (1000 * 60));
+                const seconds = Math.floor((timeLeft % (1000 * 60)) / 1000);
+
+                document.getElementById('countdown').innerHTML =
+                    \`⏰ 邮箱将在 <strong>\${hours}小时 \${minutes}分钟 \${seconds}秒</strong> 后过期\`;
+                document.getElementById('remainingTime').textContent = \`\${hours}:\${minutes.toString().padStart(2, '0')}\`;
+            }, 1000);
+        }
+
+        // 刷新邮件
+        async function refreshEmails() {
+            if (!currentEmail || !currentToken) return;
+
+            try {
+                const response = await fetch(\`\${API_BASE}/temp-email/\${encodeURIComponent(currentEmail)}/emails?token=\${encodeURIComponent(currentToken)}\`);
+                const result = await response.json();
+
+                if (result.success) {
+                    displayEmails(result.emails);
+                    document.getElementById('emailCount').textContent = result.emails.length;
+                } else {
+                    showError('获取邮件失败: ' + result.error);
+                }
+            } catch (error) {
+                showError('获取邮件失败: ' + error.message);
+            }
+        }
+
+        // 显示邮件列表
+        function displayEmails(emails) {
+            const emailsList = document.getElementById('emailsList');
+
+            if (!emails || emails.length === 0) {
+                emailsList.innerHTML = '<div class="alert alert-info">暂无邮件，请等待邮件到达...</div>';
+                return;
+            }
+
+            emailsList.innerHTML = emails.map(email => \`
+                <div class="email-item">
+                    <div class="email-header">
+                        <div class="email-from">来自: \${email.from_email}</div>
+                        <div class="email-time">\${new Date(email.created_at).toLocaleString()}</div>
+                    </div>
+                    <div class="email-subject">\${email.subject || '无主题'}</div>
+                    <div class="email-preview">\${getEmailPreview(email.body_text)}</div>
+                    <div class="email-actions">
+                        <button onclick="viewEmail('\${email.message_id}')" class="btn btn-primary">查看详情</button>
+                        <button onclick="markAsRead('\${email.message_id}')" class="btn btn-success">标记已读</button>
+                        <button onclick="deleteEmail('\${email.message_id}')" class="btn btn-danger">删除</button>
+                    </div>
+                </div>
+            \`).join('');
+        }
+
+        // 获取邮件预览
+        function getEmailPreview(text) {
+            if (!text) return '(无内容)';
+            return text.length > 200 ? text.substring(0, 200) + '...' : text;
+        }
+
+        // 查看邮件详情
+        function viewEmail(messageId) {
+            alert('查看邮件详情功能 - Message ID: ' + messageId);
+            // 这里可以实现邮件详情弹窗
+        }
+
+        // 标记已读
+        async function markAsRead(messageId) {
+            try {
+                const response = await fetch(\`\${API_BASE}/temp-email/\${encodeURIComponent(currentEmail)}/mark-read\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ accessToken: currentToken, messageId })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    showSuccess('邮件已标记为已读');
+                    refreshEmails();
+                } else {
+                    showError('操作失败: ' + result.error);
+                }
+            } catch (error) {
+                showError('操作失败: ' + error.message);
+            }
+        }
+
+        // 删除邮件
+        async function deleteEmail(messageId) {
+            if (!confirm('确认删除此邮件？')) return;
+
+            try {
+                const response = await fetch(\`\${API_BASE}/temp-email/\${encodeURIComponent(currentEmail)}/delete-email\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ accessToken: currentToken, messageId })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    showSuccess('邮件已删除');
+                    refreshEmails();
+                } else {
+                    showError('删除失败: ' + result.error);
+                }
+            } catch (error) {
+                showError('删除失败: ' + error.message);
+            }
+        }
+
+        // 延长时间
+        async function extendTime() {
+            const hours = prompt('延长多少小时？(1-48)', '24');
+            if (!hours || isNaN(hours) || hours < 1 || hours > 48) return;
+
+            try {
+                const response = await fetch(\`\${API_BASE}/temp-email/\${encodeURIComponent(currentEmail)}/extend\`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ accessToken: currentToken, additionalHours: parseInt(hours) })
+                });
+
+                const result = await response.json();
+
+                if (result.success) {
+                    expiresAt = new Date(result.newExpiryDate);
+                    showSuccess(\`时间延长成功！新过期时间: \${expiresAt.toLocaleString()}\`);
+                    startCountdown();
+                } else {
+                    showError('延长失败: ' + result.error);
+                }
+            } catch (error) {
+                showError('延长失败: ' + error.message);
+            }
+        }
+
+        // 查看统计
+        async function showStats() {
+            try {
+                const response = await fetch(\`\${API_BASE}/temp-email/\${encodeURIComponent(currentEmail)}/stats?token=\${encodeURIComponent(currentToken)}\`);
+                const result = await response.json();
+
+                if (result.success) {
+                    const statsText = \`
+邮箱地址: \${result.tempEmail.email}
+创建时间: \${new Date(result.tempEmail.created_at).toLocaleString()}
+过期时间: \${new Date(result.tempEmail.expires_at).toLocaleString()}
+最大邮件数: \${result.tempEmail.max_emails}
+已收邮件数: \${result.tempEmail.received_count}
+用途: \${getPurposeText(result.tempEmail.purpose)}
+
+最近使用记录:
+\${result.usage.slice(0, 5).map(record =>
+    \`\${new Date(record.timestamp).toLocaleString()} - \${record.action}\`
+).join('\\n')}
+                    \`;
+                    alert(statsText);
+                } else {
+                    showError('获取统计失败: ' + result.error);
+                }
+            } catch (error) {
+                showError('获取统计失败: ' + error.message);
+            }
+        }
+
+        // 重置邮箱
+        function resetEmail() {
+            if (!confirm('确认创建新的临时邮箱？当前邮箱信息将丢失。')) return;
+
+            currentEmail = '';
+            currentToken = '';
+            expiresAt = null;
+
+            if (countdownInterval) {
+                clearInterval(countdownInterval);
+            }
+
+            document.getElementById('emailSection').classList.add('hidden');
+            document.getElementById('emailsSection').classList.add('hidden');
+        }
+
+        // 加载现有邮箱
+        function loadExistingEmail() {
+            const email = document.getElementById('existingEmail').value.trim();
+            const token = document.getElementById('existingToken').value.trim();
+
+            if (!email || !token) {
+                showError('请输入邮箱地址和访问令牌');
+                return;
+            }
+
+            // 简单验证邮箱格式
+            if (!email.includes('@')) {
+                showError('请输入有效的邮箱地址');
+                return;
+            }
+
+            currentEmail = email;
+            currentToken = token;
+
+            // 尝试获取邮箱信息
+            refreshEmails().then(() => {
+                // 如果成功获取邮件，显示邮箱区域
+                document.getElementById('emailDisplay').firstChild.textContent = email;
+                document.getElementById('tokenText').textContent = token;
+                document.getElementById('emailSection').classList.remove('hidden');
+                document.getElementById('emailsSection').classList.remove('hidden');
+
+                // 尝试获取统计信息来确定过期时间
+                fetch(\`\${API_BASE}/temp-email/\${encodeURIComponent(email)}/stats?token=\${encodeURIComponent(token)}\`)
+                    .then(response => response.json())
+                    .then(result => {
+                        if (result.success) {
+                            expiresAt = new Date(result.tempEmail.expires_at);
+                            document.getElementById('maxEmails').textContent = result.tempEmail.max_emails;
+                            startCountdown();
+                        }
+                    })
+                    .catch(() => {
+                        // 如果无法获取统计信息，使用默认设置
+                        document.getElementById('maxEmails').textContent = '未知';
+                        document.getElementById('remainingTime').textContent = '未知';
+                    });
+
+                showSuccess('邮箱加载成功！');
+                document.getElementById('emailSection').scrollIntoView({ behavior: 'smooth' });
+            }).catch(() => {
+                showError('无法加载邮箱，请检查邮箱地址和访问令牌');
+            });
+        }
+
+        // 复制邮箱地址
+        function copyEmail() {
+            copyToClipboard(currentEmail, '邮箱地址已复制到剪贴板');
+        }
+
+        // 复制访问令牌
+        function copyToken() {
+            copyToClipboard(currentToken, '访问令牌已复制到剪贴板');
+        }
+
+        // 复制到剪贴板
+        function copyToClipboard(text, message) {
+            if (navigator.clipboard) {
+                navigator.clipboard.writeText(text).then(() => {
+                    showSuccess(message);
+                }).catch(() => {
+                    fallbackCopy(text, message);
+                });
+            } else {
+                fallbackCopy(text, message);
+            }
+        }
+
+        // 备用复制方法
+        function fallbackCopy(text, message) {
+            const textArea = document.createElement('textarea');
+            textArea.value = text;
+            document.body.appendChild(textArea);
+            textArea.select();
+            try {
+                document.execCommand('copy');
+                showSuccess(message);
+            } catch (err) {
+                showError('复制失败，请手动复制');
+            }
+            document.body.removeChild(textArea);
+        }
+
+        // 显示成功消息
+        function showSuccess(message) {
+            showMessage(message, 'success');
+        }
+
+        // 显示错误消息
+        function showError(message) {
+            showMessage(message, 'danger');
+        }
+
+        // 显示消息
+        function showMessage(message, type) {
+            const alertDiv = document.createElement('div');
+            alertDiv.className = \`alert alert-\${type}\`;
+            alertDiv.textContent = message;
+            alertDiv.style.position = 'fixed';
+            alertDiv.style.top = '20px';
+            alertDiv.style.right = '20px';
+            alertDiv.style.zIndex = '9999';
+            alertDiv.style.minWidth = '300px';
+            alertDiv.style.boxShadow = '0 4px 12px rgba(0,0,0,0.15)';
+
+            document.body.appendChild(alertDiv);
+
+            setTimeout(() => {
+                alertDiv.remove();
+            }, 4000);
+        }
+
+        // 获取用途文本
+        function getPurposeText(purpose) {
+            const purposeMap = {
+                'general': '通用',
+                'signup': '注册验证',
+                'verification': '邮箱验证'
+            };
+            return purposeMap[purpose] || purpose;
+        }
+
+        // 页面加载时的自动刷新
+        setInterval(() => {
+            if (currentEmail && currentToken) {
+                refreshEmails();
+            }
+        }, 30000); // 每30秒自动刷新一次
     </script>
 </body>
 </html>`;
@@ -1711,6 +5561,353 @@ async function handleGetEmail(request, auth, db, emailId, corsHeaders) {
             success: true,
             email
         }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+// Temporary Email Handler Functions
+async function handleCreateTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { expiryHours = 24, purpose = 'general', maxEmails = 50 } = body;
+
+        const result = await tempEmailService.createTempEmail(domain, {
+            expiryHours,
+            purpose,
+            maxEmails
+        });
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateSignupTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { serviceName } = body;
+
+        const result = await tempEmailService.createSignupTempEmail(domain, serviceName);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateVerificationTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { verificationType = 'email' } = body;
+
+        const result = await tempEmailService.createVerificationTempEmail(domain, verificationType);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmails(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmails(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleExtendTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, additionalHours = 24 } = body;
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.extendTempEmail(email, accessToken, additionalHours);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailStats(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getUsageStats(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleMarkTempEmailAsRead(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.markEmailAsRead(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleDeleteTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.deleteEmail(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetAllTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const url = new URL(request.url);
+        const limit = parseInt(url.searchParams.get('limit')) || 50;
+        const offset = parseInt(url.searchParams.get('offset')) || 0;
+
+        const result = await tempEmailService.getAllTempEmails(limit, offset);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailAdminStats(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmailStats();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCleanupExpiredTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.cleanupExpiredEmails();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
             headers: { ...corsHeaders, 'Content-Type': 'application/json' }
         });
     } catch (error) {
@@ -1813,6 +6010,353 @@ async function handleSendEmailSimple(request, resend, db, apiToken, corsHeaders)
     }
 }
 
+// Temporary Email Handler Functions
+async function handleCreateTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { expiryHours = 24, purpose = 'general', maxEmails = 50 } = body;
+
+        const result = await tempEmailService.createTempEmail(domain, {
+            expiryHours,
+            purpose,
+            maxEmails
+        });
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateSignupTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { serviceName } = body;
+
+        const result = await tempEmailService.createSignupTempEmail(domain, serviceName);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateVerificationTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { verificationType = 'email' } = body;
+
+        const result = await tempEmailService.createVerificationTempEmail(domain, verificationType);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmails(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmails(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleExtendTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, additionalHours = 24 } = body;
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.extendTempEmail(email, accessToken, additionalHours);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailStats(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getUsageStats(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleMarkTempEmailAsRead(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.markEmailAsRead(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleDeleteTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.deleteEmail(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetAllTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const url = new URL(request.url);
+        const limit = parseInt(url.searchParams.get('limit')) || 50;
+        const offset = parseInt(url.searchParams.get('offset')) || 0;
+
+        const result = await tempEmailService.getAllTempEmails(limit, offset);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailAdminStats(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmailStats();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCleanupExpiredTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.cleanupExpiredEmails();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
 async function handleEmailStatus(request, resend, auth, emailId, corsHeaders) {
     try {
         const authHeader = request.headers.get('Authorization');
@@ -1836,6 +6380,353 @@ async function handleEmailStatus(request, resend, auth, emailId, corsHeaders) {
         const result = await resend.getEmail(emailId);
 
         return new Response(JSON.stringify(result), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+// Temporary Email Handler Functions
+async function handleCreateTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { expiryHours = 24, purpose = 'general', maxEmails = 50 } = body;
+
+        const result = await tempEmailService.createTempEmail(domain, {
+            expiryHours,
+            purpose,
+            maxEmails
+        });
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateSignupTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { serviceName } = body;
+
+        const result = await tempEmailService.createSignupTempEmail(domain, serviceName);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateVerificationTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { verificationType = 'email' } = body;
+
+        const result = await tempEmailService.createVerificationTempEmail(domain, verificationType);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmails(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmails(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleExtendTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, additionalHours = 24 } = body;
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.extendTempEmail(email, accessToken, additionalHours);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailStats(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getUsageStats(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleMarkTempEmailAsRead(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.markEmailAsRead(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleDeleteTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.deleteEmail(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetAllTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const url = new URL(request.url);
+        const limit = parseInt(url.searchParams.get('limit')) || 50;
+        const offset = parseInt(url.searchParams.get('offset')) || 0;
+
+        const result = await tempEmailService.getAllTempEmails(limit, offset);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailAdminStats(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmailStats();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCleanupExpiredTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.cleanupExpiredEmails();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
             headers: { ...corsHeaders, 'Content-Type': 'application/json' }
         });
     } catch (error) {
@@ -1877,6 +6768,353 @@ async function handleGetUserToken(request, auth, db, corsHeaders) {
             success: true,
             token: apiToken ? apiToken.name : null
         }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+// Temporary Email Handler Functions
+async function handleCreateTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { expiryHours = 24, purpose = 'general', maxEmails = 50 } = body;
+
+        const result = await tempEmailService.createTempEmail(domain, {
+            expiryHours,
+            purpose,
+            maxEmails
+        });
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateSignupTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { serviceName } = body;
+
+        const result = await tempEmailService.createSignupTempEmail(domain, serviceName);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateVerificationTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { verificationType = 'email' } = body;
+
+        const result = await tempEmailService.createVerificationTempEmail(domain, verificationType);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmails(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmails(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleExtendTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, additionalHours = 24 } = body;
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.extendTempEmail(email, accessToken, additionalHours);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailStats(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getUsageStats(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleMarkTempEmailAsRead(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.markEmailAsRead(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleDeleteTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.deleteEmail(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetAllTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const url = new URL(request.url);
+        const limit = parseInt(url.searchParams.get('limit')) || 50;
+        const offset = parseInt(url.searchParams.get('offset')) || 0;
+
+        const result = await tempEmailService.getAllTempEmails(limit, offset);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailAdminStats(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmailStats();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCleanupExpiredTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.cleanupExpiredEmails();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
             headers: { ...corsHeaders, 'Content-Type': 'application/json' }
         });
     } catch (error) {
@@ -1934,6 +7172,353 @@ async function handleGenerateUserToken(request, auth, db, corsHeaders) {
     }
 }
 
+// Temporary Email Handler Functions
+async function handleCreateTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { expiryHours = 24, purpose = 'general', maxEmails = 50 } = body;
+
+        const result = await tempEmailService.createTempEmail(domain, {
+            expiryHours,
+            purpose,
+            maxEmails
+        });
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateSignupTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { serviceName } = body;
+
+        const result = await tempEmailService.createSignupTempEmail(domain, serviceName);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateVerificationTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { verificationType = 'email' } = body;
+
+        const result = await tempEmailService.createVerificationTempEmail(domain, verificationType);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmails(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmails(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleExtendTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, additionalHours = 24 } = body;
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.extendTempEmail(email, accessToken, additionalHours);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailStats(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getUsageStats(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleMarkTempEmailAsRead(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.markEmailAsRead(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleDeleteTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.deleteEmail(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetAllTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const url = new URL(request.url);
+        const limit = parseInt(url.searchParams.get('limit')) || 50;
+        const offset = parseInt(url.searchParams.get('offset')) || 0;
+
+        const result = await tempEmailService.getAllTempEmails(limit, offset);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailAdminStats(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmailStats();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCleanupExpiredTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.cleanupExpiredEmails();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
 async function handleGetAllUserTokens(request, auth, db, corsHeaders) {
     try {
         const authHeader = request.headers.get('Authorization');
@@ -1981,6 +7566,353 @@ async function handleGetAllUserTokens(request, auth, db, corsHeaders) {
     }
 }
 
+// Temporary Email Handler Functions
+async function handleCreateTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { expiryHours = 24, purpose = 'general', maxEmails = 50 } = body;
+
+        const result = await tempEmailService.createTempEmail(domain, {
+            expiryHours,
+            purpose,
+            maxEmails
+        });
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateSignupTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { serviceName } = body;
+
+        const result = await tempEmailService.createSignupTempEmail(domain, serviceName);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateVerificationTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { verificationType = 'email' } = body;
+
+        const result = await tempEmailService.createVerificationTempEmail(domain, verificationType);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmails(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmails(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleExtendTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, additionalHours = 24 } = body;
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.extendTempEmail(email, accessToken, additionalHours);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailStats(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getUsageStats(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleMarkTempEmailAsRead(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.markEmailAsRead(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleDeleteTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.deleteEmail(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetAllTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const url = new URL(request.url);
+        const limit = parseInt(url.searchParams.get('limit')) || 50;
+        const offset = parseInt(url.searchParams.get('offset')) || 0;
+
+        const result = await tempEmailService.getAllTempEmails(limit, offset);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailAdminStats(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmailStats();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCleanupExpiredTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.cleanupExpiredEmails();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
 async function handleGetUserTokenById(request, auth, db, userId, corsHeaders) {
     try {
         const authHeader = request.headers.get('Authorization');
@@ -2012,6 +7944,353 @@ async function handleGetUserTokenById(request, auth, db, userId, corsHeaders) {
             success: true,
             token: apiToken ? apiToken.name : null
         }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+// Temporary Email Handler Functions
+async function handleCreateTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { expiryHours = 24, purpose = 'general', maxEmails = 50 } = body;
+
+        const result = await tempEmailService.createTempEmail(domain, {
+            expiryHours,
+            purpose,
+            maxEmails
+        });
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateSignupTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { serviceName } = body;
+
+        const result = await tempEmailService.createSignupTempEmail(domain, serviceName);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateVerificationTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { verificationType = 'email' } = body;
+
+        const result = await tempEmailService.createVerificationTempEmail(domain, verificationType);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmails(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmails(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleExtendTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, additionalHours = 24 } = body;
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.extendTempEmail(email, accessToken, additionalHours);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailStats(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getUsageStats(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleMarkTempEmailAsRead(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.markEmailAsRead(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleDeleteTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.deleteEmail(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetAllTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const url = new URL(request.url);
+        const limit = parseInt(url.searchParams.get('limit')) || 50;
+        const offset = parseInt(url.searchParams.get('offset')) || 0;
+
+        const result = await tempEmailService.getAllTempEmails(limit, offset);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailAdminStats(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmailStats();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCleanupExpiredTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.cleanupExpiredEmails();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
             headers: { ...corsHeaders, 'Content-Type': 'application/json' }
         });
     } catch (error) {
@@ -2069,6 +8348,353 @@ async function handleGenerateUserTokenById(request, auth, db, userId, corsHeader
     }
 }
 
+// Temporary Email Handler Functions
+async function handleCreateTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { expiryHours = 24, purpose = 'general', maxEmails = 50 } = body;
+
+        const result = await tempEmailService.createTempEmail(domain, {
+            expiryHours,
+            purpose,
+            maxEmails
+        });
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateSignupTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { serviceName } = body;
+
+        const result = await tempEmailService.createSignupTempEmail(domain, serviceName);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateVerificationTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { verificationType = 'email' } = body;
+
+        const result = await tempEmailService.createVerificationTempEmail(domain, verificationType);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmails(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmails(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleExtendTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, additionalHours = 24 } = body;
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.extendTempEmail(email, accessToken, additionalHours);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailStats(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getUsageStats(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleMarkTempEmailAsRead(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.markEmailAsRead(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleDeleteTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.deleteEmail(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetAllTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const url = new URL(request.url);
+        const limit = parseInt(url.searchParams.get('limit')) || 50;
+        const offset = parseInt(url.searchParams.get('offset')) || 0;
+
+        const result = await tempEmailService.getAllTempEmails(limit, offset);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailAdminStats(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmailStats();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCleanupExpiredTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.cleanupExpiredEmails();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
 async function handleResendWebhook(request, db, corsHeaders) {
     try {
         const webhook = await request.json();
@@ -2089,6 +8715,353 @@ async function handleResendWebhook(request, db, corsHeaders) {
         }
 
         return new Response(JSON.stringify({ success: true }), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+// Temporary Email Handler Functions
+async function handleCreateTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { expiryHours = 24, purpose = 'general', maxEmails = 50 } = body;
+
+        const result = await tempEmailService.createTempEmail(domain, {
+            expiryHours,
+            purpose,
+            maxEmails
+        });
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateSignupTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { serviceName } = body;
+
+        const result = await tempEmailService.createSignupTempEmail(domain, serviceName);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateVerificationTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { verificationType = 'email' } = body;
+
+        const result = await tempEmailService.createVerificationTempEmail(domain, verificationType);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmails(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmails(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleExtendTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, additionalHours = 24 } = body;
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.extendTempEmail(email, accessToken, additionalHours);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailStats(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getUsageStats(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleMarkTempEmailAsRead(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.markEmailAsRead(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleDeleteTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.deleteEmail(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetAllTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const url = new URL(request.url);
+        const limit = parseInt(url.searchParams.get('limit')) || 50;
+        const offset = parseInt(url.searchParams.get('offset')) || 0;
+
+        const result = await tempEmailService.getAllTempEmails(limit, offset);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailAdminStats(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmailStats();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCleanupExpiredTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.cleanupExpiredEmails();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
             headers: { ...corsHeaders, 'Content-Type': 'application/json' }
         });
     } catch (error) {
@@ -2256,6 +9229,353 @@ async function handleGetUsageStats(request, auth, db, corsHeaders) {
         };
 
         return new Response(JSON.stringify(result), {
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+// Temporary Email Handler Functions
+async function handleCreateTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { expiryHours = 24, purpose = 'general', maxEmails = 50 } = body;
+
+        const result = await tempEmailService.createTempEmail(domain, {
+            expiryHours,
+            purpose,
+            maxEmails
+        });
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateSignupTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { serviceName } = body;
+
+        const result = await tempEmailService.createSignupTempEmail(domain, serviceName);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCreateVerificationTempEmail(request, tempEmailService, domain, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json().catch(() => ({}));
+        const { verificationType = 'email' } = body;
+
+        const result = await tempEmailService.createVerificationTempEmail(domain, verificationType);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmails(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmails(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleExtendTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, additionalHours = 24 } = body;
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.extendTempEmail(email, accessToken, additionalHours);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailStats(request, tempEmailService, email, corsHeaders) {
+    try {
+        const url = new URL(request.url);
+        const accessToken = url.searchParams.get('token') || request.headers.get('X-Access-Token');
+
+        if (!accessToken) {
+            return new Response(JSON.stringify({ error: 'Access token required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getUsageStats(email, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleMarkTempEmailAsRead(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.markEmailAsRead(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleDeleteTempEmail(request, tempEmailService, email, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const body = await request.json();
+        const { accessToken, messageId } = body;
+
+        if (!accessToken || !messageId) {
+            return new Response(JSON.stringify({ error: 'Access token and message ID required' }), {
+                status: 400,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.deleteEmail(email, messageId, accessToken);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetAllTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const url = new URL(request.url);
+        const limit = parseInt(url.searchParams.get('limit')) || 50;
+        const offset = parseInt(url.searchParams.get('offset')) || 0;
+
+        const result = await tempEmailService.getAllTempEmails(limit, offset);
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleGetTempEmailAdminStats(request, auth, tempEmailService, corsHeaders) {
+    try {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.getTempEmailStats();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({ error: error.message }), {
+            status: 400,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+async function handleCleanupExpiredTempEmails(request, auth, tempEmailService, corsHeaders) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({ error: 'Method not allowed' }), {
+                status: 405,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader) {
+            return new Response(JSON.stringify({ error: 'Authorization required' }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const token = authHeader.replace('Bearer ', '');
+        const authResult = await auth.validateToken(token);
+
+        if (!authResult.valid) {
+            return new Response(JSON.stringify({ error: authResult.error }), {
+                status: 401,
+                headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+            });
+        }
+
+        const result = await tempEmailService.cleanupExpiredEmails();
+
+        return new Response(JSON.stringify(result), {
+            status: result.success ? 200 : 400,
             headers: { ...corsHeaders, 'Content-Type': 'application/json' }
         });
     } catch (error) {
